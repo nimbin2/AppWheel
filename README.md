@@ -91,13 +91,28 @@ That produces an `appwheel` binary in the current directory. Try it:
 make static
 ```
 This bakes SDL3 into the binary (`libSDL3.a`), so it no longer needs `libSDL3.so`
-installed — handy for dropping the single file on another machine. Two honest
-caveats: it needs SDL's **static** library present (distro packages don't always
-ship `libSDL3.a`; if missing, build SDL from source with `-DSDL_STATIC=ON`), and
-even then SDL still loads your system's **Wayland/X11** libraries at runtime — so
-it removes the SDL install requirement, not literally every dependency. (There's no
-prebuilt binary in this repo on purpose: it would be tied to one distro's libc and
-whichever display backends SDL happened to be built with.)
+installed — handy for dropping the single file on another machine. Caveats:
+- It needs SDL's **static** library (`libSDL3.a`); distro packages don't always ship
+  it, so you may need to build SDL from source with `-DSDL_STATIC=ON`.
+- SDL still loads your system's **Wayland/X11** libraries at runtime via `dlopen`,
+  so this removes the SDL install requirement, not literally every dependency —
+  and a *fully* static (`-static`) binary is a poor fit for SDL for that reason.
+- **`make static` does not make it portable across distros.** glibc stays dynamic,
+  and glibc is forward-incompatible: a binary built on a bleeding-edge distro (Arch,
+  etc.) will fail on older Ubuntu with `GLIBC_2.xx not found`.
+
+### Running it on other distros (fixing `GLIBC_2.xx not found`)
+Build against the **oldest glibc** you need to support. Easiest is to build on that
+machine directly (Install steps above). To produce **one binary that runs on many
+distros**, compile inside an older Ubuntu container with the included script (needs
+Docker or Podman):
+```sh
+./build-portable.sh          # builds against ubuntu:22.04 (glibc 2.35)
+./build-portable.sh 20.04    # older glibc 2.31 -> even wider compatibility
+```
+The result runs on that Ubuntu release and anything newer. (There's still no
+prebuilt binary in this repo on purpose — a portable build has to be pinned to a
+specific glibc/toolchain, which is a choice best made on your end.)
 
 ### 4. Put it on your PATH
 ```sh
