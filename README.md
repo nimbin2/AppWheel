@@ -4,6 +4,8 @@ A GTA-V-style radial **weapon-wheel launcher** for your apps, in one C file.
 Point at a slice to pick an app, type to filter, hit Enter to launch. Runs on
 **Wayland & X11** (SDL3).
 
+![AppWheel screenshot](screenshot.png)
+
 > ### ⚠️ Heads up: this is a 100% vibe-coded project
 > Every line here was written by **Claude (Anthropic)** from a chat conversation —
 > design, code, and docs. It compiles clean and was exercised in a headless test
