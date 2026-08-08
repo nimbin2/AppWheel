@@ -35,15 +35,24 @@ echo ">> building appwheel inside ubuntu:$TAG (this compiles SDL3, give it a few
     apt-get install -y --no-install-recommends \
         build-essential git cmake pkg-config ca-certificates file \
         libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
+        libxss-dev libxrender-dev libxinerama-dev \
         libwayland-dev wayland-protocols libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev
 
     if [ ! -d SDL ]; then
         git clone --depth 1 https://github.com/libsdl-org/SDL
     fi
-    cmake -S SDL -B SDL/build -DCMAKE_BUILD_TYPE=Release -DSDL_STATIC=ON -DSDL_SHARED=OFF >/dev/null
+    # Video-only SDL: appwheel only uses SDL_INIT_VIDEO, so we switch off audio,
+    # input-device, and misc subsystems. That avoids pulling ALSA/PulseAudio/udev
+    # /dbus dev packages and keeps the dependency surface (and build) small.
+    cmake -S SDL -B SDL/build \
+        -DCMAKE_BUILD_TYPE=Release -DSDL_STATIC=ON -DSDL_SHARED=OFF \
+        -DSDL_AUDIO=OFF -DSDL_JOYSTICK=OFF -DSDL_HAPTIC=OFF -DSDL_SENSOR=OFF \
+        -DSDL_CAMERA=OFF -DSDL_POWER=OFF -DSDL_DBUS=OFF -DSDL_IBUS=OFF \
+        -DSDL_TEST_LIBRARY=OFF -DSDL_EXAMPLES=OFF >/dev/null
     cmake --build SDL/build -j"$(nproc)"
     cmake --install SDL/build >/dev/null
     ldconfig
+    export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
 
     make static
     strip appwheel 2>/dev/null || true
