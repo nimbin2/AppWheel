@@ -110,8 +110,10 @@ Docker or Podman):
 ./build-portable.sh          # builds against ubuntu:22.04 (glibc 2.35)
 ./build-portable.sh 20.04    # older glibc 2.31 -> even wider compatibility
 ```
-The result runs on that Ubuntu release and anything newer. (There's still no
-prebuilt binary in this repo on purpose — a portable build has to be pinned to a
+The result runs on that Ubuntu release and anything newer. It pins a known-good SDL
+release (`release-3.2.14`) and links it statically; override with
+`SDL_TAG=release-3.2.30 ./build-portable.sh` if you want a newer one. (There's still
+no prebuilt binary in this repo on purpose — a portable build has to be pinned to a
 specific glibc/toolchain, which is a choice best made on your end.)
 
 ### 4. Put it on your PATH
