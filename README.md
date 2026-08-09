@@ -5,29 +5,44 @@ A radial "weapon-wheel" application launcher for Linux (Wayland and X11),
 in a single C file. Point at a slice to pick an app, type to filter, Enter
 to launch.
 
+![AppWheel screenshot](screenshot.png)
+
 This is a vibe-coded project: 100% written by Claude (Anthropic) from a chat.
 It builds clean and was tested headless, but not on real hardware — read it
 before you trust it.
-
-![AppWheel screenshot](screenshot.png)
 
 
 Requirements
 ------------
 
-  - a C compiler and pkg-config
-  - SDL3 development files:
+A C compiler, pkg-config, and the SDL3 development files.
 
-      Arch          sudo pacman -S sdl3
-      Fedora        sudo dnf install SDL3-devel
-      Debian/Ubuntu sudo apt install libsdl3-dev     (24.10 or newer)
+Arch:
 
-  If your distro has no SDL3 package, build it once from source:
+```sh
+sudo pacman -S sdl3
+```
 
-      git clone --depth 1 https://github.com/libsdl-org/SDL
-      cmake -S SDL -B SDL/build -DCMAKE_BUILD_TYPE=Release
-      cmake --build SDL/build -j
-      sudo cmake --install SDL/build && sudo ldconfig
+Fedora:
+
+```sh
+sudo dnf install SDL3-devel
+```
+
+Debian / Ubuntu (24.10 or newer):
+
+```sh
+sudo apt install libsdl3-dev
+```
+
+If your distro has no SDL3 package, build it once from source:
+
+```sh
+git clone --depth 1 https://github.com/libsdl-org/SDL
+cmake -S SDL -B SDL/build -DCMAKE_BUILD_TYPE=Release
+cmake --build SDL/build -j
+sudo cmake --install SDL/build && sudo ldconfig
+```
 
 
 Build
