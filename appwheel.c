@@ -129,8 +129,8 @@ static void config_defaults(Config*c){
     memset(c,0,sizeof *c);
     c->width=900; c->height=900;
     c->slots=10; c->arc_deg=240.0f; c->page_ms=110;
-    c->icons=1; c->icon_px=46; c->ui_scale=1.0f; c->font_px=48;
-    c->label_px=17; c->title_px=23; c->search_px=18; c->count_px=14;
+    c->icons=1; c->icon_px=46; c->ui_scale=1.0f; c->font_px=50;
+    c->label_px=24; c->title_px=25; c->search_px=20; c->count_px=20;
     c->ssaa=2;
     strcpy(c->sort,"recent"); strcpy(c->launcher,"sh");
     const char*term=getenv("TERMINAL");
