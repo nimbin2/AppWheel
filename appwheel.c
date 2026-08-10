@@ -842,6 +842,7 @@ int main(int argc,char**argv){
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
+    Uint64 start_time = SDL_GetTicks();   /* used to suppress paging on the first frame */
     int running=1;
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
 
@@ -877,7 +878,17 @@ int main(int argc,char**argv){
                   page_dir = dtop>0?1:-1;             /* right=forward, left=back */
                   float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
                   page_speed = maxd>0?clampf(depth/maxd,0,1):0;
-                  if(fn>vis){
+                  /* Suppress automatic paging on the very first frame after the
+                     wheel appears.  The user often starts the program with the
+                     mouse already over the pagination zone, which would cause an
+                     unwanted page‑turn.  We ignore paging for the first 200 ms. */
+                  if(SDL_GetTicks() - start_time < 200){
+                      /* also move the virtual cursor to a safe place (the centre
+                         of the top slot) so the next frame sees a “good” position. */
+                      mx = cx + rl * cosf(top);
+                      my = cy + rl * sinf(top);
+                      page_dir = 0;
+                  } else if(fn>vis){
                       Uint64 now=SDL_GetTicks();
                       float t=page_speed*page_speed;   /* ease in: gentle start, fast finish */
                       int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
@@ -966,7 +977,7 @@ int main(int argc,char**argv){
         float label_px=cfg.label_px*ui;
         for(int i=0;i<vis;i++){
             int item=filt[off+i];
-            float a=astart+i*step;
+            float a = (vis==1) ? top : (astart + i*step);
             float a0=a-slotw/2+0.010f, a1=a+slotw/2-0.010f;
             int hot=(off+i==sel);
             Col scol=hot?cfg.hl:(i&1?cfg.ring2:cfg.ring);
