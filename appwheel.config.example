@@ -25,14 +25,14 @@ icon_px=46        # icon size (before ui_scale)
 # --- text ---
 ui_scale=1.0      # master text size. 1.3 = bigger, 0.85 = smaller.
                   # aliases: font_scale, text_scale
-label_px=17       # app labels on the wheel   (all four are multiplied by
-title_px=23       # selected app name (center)  ui_scale, so tweak one or all)
-search_px=18      # the text you type (search box)
-count_px=14       # the "3 / 42" counter
+label_px=24       # app labels on the wheel   (all four are multiplied by
+title_px=25       # selected app name (center)  ui_scale, so tweak one or all)
+search_px=20      # the text you type (search box)
+count_px=20       # the "3 / 42" counter
 # By default appwheel uses your desktop's configured font (via fontconfig).
 # Set a .ttf path or a family name to override, e.g. font=JetBrains Mono
 # font=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-font_px=48        # glyph atlas height; the sharpness ceiling for big text
+font_px=50        # glyph atlas height; the sharpness ceiling for big text
 
 # --- launching / ordering ---
 # appwheel logs every app you launch to the history file below and shows the

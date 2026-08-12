@@ -646,14 +646,14 @@ static void dump_config(void){
 "# --- text ---\n"
 "ui_scale=1.0      # master text size. 1.3 = bigger, 0.85 = smaller.\n"
 "                  # aliases: font_scale, text_scale\n"
-"label_px=17       # app labels on the wheel   (all four are multiplied by\n"
-"title_px=23       # selected app name (center)  ui_scale, so tweak one or all)\n"
-"search_px=18      # the text you type (search box)\n"
-"count_px=14       # the \"3 / 42\" counter\n"
+"label_px=24       # app labels on the wheel   (all four are multiplied by\n"
+"title_px=25       # selected app name (center)  ui_scale, so tweak one or all)\n"
+"search_px=20      # the text you type (search box)\n"
+"count_px=20       # the \"3 / 42\" counter\n"
 "# By default appwheel uses your desktop's configured font (via fontconfig).\n"
 "# Set a .ttf path or a family name to override, e.g. font=JetBrains Mono\n"
 "# font=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\n"
-"font_px=48        # glyph atlas height; the sharpness ceiling for big text\n"
+"font_px=50        # glyph atlas height; the sharpness ceiling for big text\n"
 "\n"
 "# --- launching / ordering ---\n"
 "# appwheel logs every app you launch to the history file below and shows the\n"
@@ -714,13 +714,13 @@ static void usage(const char*a0){
 "\n"
 "TEXT\n"
 "  ui_scale=1.0        master text size (aliases: font_scale, text_scale)\n"
-"  label_px=17         app labels on the wheel     ) each is multiplied\n"
-"  title_px=23         selected app name (center)  ) by ui_scale; set any\n"
-"  search_px=18        the text you type           ) one independently\n"
-"  count_px=14         the \"3 / 42\" counter        )\n"
+"  label_px=24         app labels on the wheel     ) each is multiplied\n"
+"  title_px=25         selected app name (center)  ) by ui_scale; set any\n"
+"  search_px=20        the text you type           ) one independently\n"
+"  count_px=20         the \"3 / 42\" counter        )\n"
 "  font=PATH|FAMILY    a .ttf path, or a fontconfig family like \"JetBrains Mono\".\n"
 "                      Default: your desktop's configured font (via fc-match).\n"
-"  font_px=48          atlas raster height; larger = crisper big text\n"
+"  font_px=50          atlas raster height; larger = crisper big text\n"
 "\n"
 "RENDERING\n"
 "  ssaa=2              full-scene supersampling 1..4 (smooths edges; alias: aa)\n"
@@ -842,7 +842,6 @@ int main(int argc,char**argv){
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
-    Uint64 start_time = SDL_GetTicks();   /* used to suppress paging on the first frame */
     int running=1;
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
 
@@ -863,13 +862,13 @@ int main(int argc,char**argv){
         int sel = fn? off+selslot : 0;
         if(sel>fn-1)sel=fn-1;
 
-        float step = vis>1?arc/(vis-1):0;
+        float step = arc/(float)(vis>0?vis:1);   /* equal sectors fill the arc */
         float top=-(float)M_PI/2;
         float astart=top-arc/2;
 
         /* --- paging: only past the OUTER edge of the end slots; the deeper
            you go toward straight-down, the FASTER it pages (slow -> fast) --- */
-        float half_arc = arc/2 + step/2;              /* outer edge of end slots */
+        float half_arc = arc/2 + 2.0f*(float)DEG;     /* apps fill the arc; page below it */
         page_dir=0; page_speed=0;
         { float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
           if(dist>rc){
@@ -878,17 +877,7 @@ int main(int argc,char**argv){
                   page_dir = dtop>0?1:-1;             /* right=forward, left=back */
                   float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
                   page_speed = maxd>0?clampf(depth/maxd,0,1):0;
-                  /* Suppress automatic paging on the very first frame after the
-                     wheel appears.  The user often starts the program with the
-                     mouse already over the pagination zone, which would cause an
-                     unwanted page‑turn.  We ignore paging for the first 200 ms. */
-                  if(SDL_GetTicks() - start_time < 200){
-                      /* also move the virtual cursor to a safe place (the centre
-                         of the top slot) so the next frame sees a “good” position. */
-                      mx = cx + rl * cosf(top);
-                      my = cy + rl * sinf(top);
-                      page_dir = 0;
-                  } else if(fn>vis){
+                  if(fn>vis){
                       Uint64 now=SDL_GetTicks();
                       float t=page_speed*page_speed;   /* ease in: gentle start, fast finish */
                       int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
@@ -911,9 +900,8 @@ int main(int argc,char**argv){
                 float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
                 if(dist>rc && vis>0){
                     float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
-                    if(fabsf(dtop)<=half_arc){                /* within app arc */
-                        float dstart=dtop+arc/2;              /* 0..arc across slots */
-                        int slot=(int)lroundf(dstart/(step>0?step:1));
+                    if(fabsf(dtop)<=half_arc){                /* within the app arc */
+                        int slot=(int)floorf((dtop+arc/2)/(step>0?step:1));  /* which sector */
                         if(slot<0)slot=0; if(slot>vis-1)slot=vis-1;
                         selslot=slot;
                     }
@@ -973,11 +961,11 @@ int main(int argc,char**argv){
         SDL_SetRenderDrawColor(ren,cfg.bg.r,cfg.bg.g,cfg.bg.b,cfg.bg.a);
         SDL_RenderClear(ren);
 
-        float slotw=step>0?step:arc;
+        float slotw=step;
         float label_px=cfg.label_px*ui;
         for(int i=0;i<vis;i++){
             int item=filt[off+i];
-            float a = (vis==1) ? top : (astart + i*step);
+            float a=astart+(i+0.5f)*step;
             float a0=a-slotw/2+0.010f, a1=a+slotw/2-0.010f;
             int hot=(off+i==sel);
             Col scol=hot?cfg.hl:(i&1?cfg.ring2:cfg.ring);
