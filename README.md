@@ -126,10 +126,3 @@ Running on another distro
       ./build-portable.sh
 
   The result runs on that Ubuntu release and anything newer.
-
-
-License
--------
-
-  GPL-2.0 (see LICENSE). The bundled stb headers are public domain and SDL3
-  is under the zlib license; both are compatible.

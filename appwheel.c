@@ -1,23 +1,11 @@
 /*
- * SPDX-License-Identifier: GPL-2.0-only
- *
  * appwheel — a GTA-V-style radial (weapon-wheel) app launcher for Wayland & X11.
- * Copyright (C) 2025  appwheel contributors
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
+ * This program is free software; you can redistribute it and/or modify it.
  *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program (see the LICENSE file); if not, see
- * <https://www.gnu.org/licenses/>.
- *
- * The bundled stb_truetype.h and stb_image.h are public domain, and SDL3 is
- * under the permissive zlib license — both are compatible with GPL-2.0.
  *
  * Dependencies:
  *   - SDL3            (the only library you link)
