@@ -828,6 +828,7 @@ int main(int argc,char**argv){
 
     int off=0, selslot=0;                 /* fixed highlight = off+selslot     */
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
+    int paging_armed=0, hotL_prev=0, hotR_prev=0;
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
     int running=1;
@@ -835,6 +836,9 @@ int main(int argc,char**argv){
 
     SDL_Texture*target=NULL; int tw=0,th=0;
     float ui=cfg.ui_scale;
+
+    /* Use real pointer position at start (important for the “don’t page on open” gating). */
+    SDL_GetMouseState(&mx,&my);
 
     while(running){
         int w,h; SDL_GetWindowSize(win,&w,&h);
@@ -853,32 +857,8 @@ int main(int argc,char**argv){
         float step = arc/(float)(vis>0?vis:1);   /* equal sectors fill the arc */
         float top=-(float)M_PI/2;
         float astart=top-arc/2;
-
-        /* --- paging: only past the OUTER edge of the end slots; the deeper
-           you go toward straight-down, the FASTER it pages (slow -> fast) --- */
         float half_arc = arc/2 + 2.0f*(float)DEG;     /* apps fill the arc; page below it */
-        page_dir=0; page_speed=0;
-        { float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
-          if(dist>rc){
-              float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
-              if(fabsf(dtop)>half_arc){               /* truly below the app arc */
-                  page_dir = dtop>0?1:-1;             /* right=forward, left=back */
-                  float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
-                  page_speed = maxd>0?clampf(depth/maxd,0,1):0;
-                  if(fn>vis){
-                      Uint64 now=SDL_GetTicks();
-                      float t=page_speed*page_speed;   /* ease in: gentle start, fast finish */
-                      int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
-                      if((Sint64)(now-last_page)>=iv){
-                          off += page_dir;             /* scroll list; highlight stays put */
-                          if(off<0)off=0;
-                          if(off>maxoff)off=maxoff;
-                          last_page=now;
-                      }
-                  }
-              }
-          }
-        }
+
 
         SDL_Event ev;
         while(SDL_PollEvent(&ev)){
@@ -892,7 +872,27 @@ int main(int argc,char**argv){
                         int slot=(int)floorf((dtop+arc/2)/(step>0?step:1));  /* which sector */
                         if(slot<0)slot=0; if(slot>vis-1)slot=vis-1;
                         selslot=slot;
+                        /* Arming condition #1: you hovered an app slot */
+                        if(!paging_armed){ paging_armed=1; last_page=SDL_GetTicks(); }
                     }
+                }
+
+                /* Arming condition #2: you deliberately enter the chevron hotspots.
+                   Requires an *edge* (outside -> inside), so “starting there” won’t arm. */
+                {
+                    float aL=120.0f*(float)DEG, aR=60.0f*(float)DEG;
+                    float lxp=cx+rl*cosf(aL), lyp=cy+rl*sinf(aL);
+                    float rxp=cx+rl*cosf(aR), ryp=cy+rl*sinf(aR);
+                    float hr=32.0f*ui; /* hotspot radius; tweak if you want */
+                    float dlx=mx-lxp, dly=my-lyp;
+                    float drx=mx-rxp, dry=my-ryp;
+                    int hotL = (dlx*dlx + dly*dly) <= hr*hr;
+                    int hotR = (drx*drx + dry*dry) <= hr*hr;
+                    if((!hotL_prev && hotL) || (!hotR_prev && hotR)){
+                        if(!paging_armed){ paging_armed=1; last_page=SDL_GetTicks(); }
+                    }
+                    hotL_prev = hotL;
+                    hotR_prev = hotR;
                 }
             }
             else if(ev.type==SDL_EVENT_MOUSE_WHEEL){
@@ -923,9 +923,42 @@ int main(int argc,char**argv){
                     if(vis>0){ if(selslot>0)selslot--; else if(off>0)off--; } }
                 else if(k==SDLK_DOWN){ if(maxoff>0){ off+=vis; if(off>maxoff)off=maxoff; } }
                 else if(k==SDLK_UP){ if(maxoff>0){ off-=vis; if(off<0)off=0; } }
+
+                /* If the user moved the highlight via keyboard, consider paging “armed”. */
+                if(k==SDLK_RIGHT||k==SDLK_TAB||k==SDLK_LEFT||k==SDLK_DOWN||k==SDLK_UP){
+                    if(!paging_armed){ paging_armed=1; last_page=SDL_GetTicks(); }
+                }
             }
         }
         if(!running) break;
+
+        /* --- paging (armed) --- */
+        page_dir=0; page_speed=0;
+        if(paging_armed){
+            /* only past the OUTER edge of the end slots; deeper toward straight-down => faster */
+            float half_arc = arc/2 + 2.0f*(float)DEG;
+            float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
+            if(dist>rc){
+                float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
+                if(fabsf(dtop)>half_arc){
+                    page_dir = dtop>0?1:-1;
+                    float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
+                    page_speed = maxd>0?clampf(depth/maxd,0,1):0;
+                    if(fn>vis){
+                        Uint64 now=SDL_GetTicks();
+                        float t=page_speed*page_speed;
+                        int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
+                        if((Sint64)(now-last_page)>=iv){
+                            off += page_dir;
+                            if(off<0)off=0;
+                            if(off>maxoff)off=maxoff;
+                            last_page=now;
+                        }
+                    }
+                }
+            }
+        }
+
 
         /* reclamp after input */
         if(off<0)off=0;
