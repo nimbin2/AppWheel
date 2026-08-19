@@ -1,17 +1,30 @@
 /*
- * appwheel — a GTA-V-style radial (weapon-wheel) app launcher for Wayland & X11.
+ * SPDX-License-Identifier: GPL-2.0-only
  *
- * This program is free software; you can redistribute it and/or modify it.
+ * appwheel — a GTA-V-style radial (weapon-wheel) app launcher for Wayland & X11.
+ * Copyright (C) 2025  appwheel contributors
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 as published by
+ * the Free Software Foundation.
  *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
  *
+ * You should have received a copy of the GNU General Public License along with
+ * this program (see the LICENSE file); if not, see
+ * <https://www.gnu.org/licenses/>.
+ *
+ * The bundled stb_truetype.h and stb_image.h are public domain, and SDL3 is
+ * under the permissive zlib license — both are compatible with GPL-2.0.
+ *
  * Dependencies:
  *   - SDL3            (the only library you link)
  *   - stb_truetype.h  (vendored single-header, public domain — smooth fonts)
- *   - stb_image.h     (vendored single-header, public domain — PNG icons)
- * The two stb_*.h files just sit next to this source; nothing to install/link.
+ *   - stb_image.h     (vendored single-header, public domain — PNG/JPG/BMP icons)
+ *   - nanosvg.h + nanosvgrast.h  (vendored single-header, zlib — SVG icons)
+ * The vendored *.h files just sit next to this source; nothing to install/link.
  *
  * Build:
  *   cc appwheel.c -o appwheel $(pkg-config --cflags --libs sdl3) -lm
@@ -25,7 +38,7 @@
  *   2. Config               the struct, defaults, key=value setter, file loader
  *   3. text (Font)          stb_truetype atlas + drawing, with a debug fallback
  *   4. AppList              .desktop parsing, dir scanning, include/exclude/sort
- *   5. icons                Icon= resolution + stb_image loading (lazy, cached)
+ *   5. icons                Icon= resolution + stb_image / nanosvg (lazy, cached)
  *   6. launching + history  detached exec, most-recently-used log
  *   7. geometry             circle/sector/chevron primitives
  *   8. usage()/dump_config  --help text and the default config generator
@@ -41,6 +54,19 @@
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_BMP
 #include "stb_image.h"
+
+/* SVG icons via nanosvg (vendored single-header, zlib license). Third-party
+   headers, so we quiet their warnings without affecting our own -Wall build. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#define NANOSVG_IMPLEMENTATION
+#define NANOSVG_ALL_COLOR_KEYWORDS
+#include "nanosvg.h"
+#define NANOSVGRAST_IMPLEMENTATION
+#include "nanosvgrast.h"
+#pragma GCC diagnostic pop
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,8 +127,9 @@ static void expand_tilde(const char*in,char*out,size_t n){
 /* config                                                              */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    int   width,height,fullscreen;
+    int   width,height,fullscreen,close_on_focus_loss;
     int   slots; float arc_deg; int page_ms;
+    float radius, y_offset;           /* wheel size + vertical nudge (of min dim) */
     int   icons, icon_px;
     float ui_scale; int font_px;
     float label_px, title_px, search_px, count_px;   /* per-element text sizes */
@@ -115,8 +142,9 @@ typedef struct {
 
 static void config_defaults(Config*c){
     memset(c,0,sizeof *c);
-    c->width=900; c->height=900;
+    c->width=900; c->height=900; c->fullscreen=1; c->close_on_focus_loss=0;
     c->slots=10; c->arc_deg=240.0f; c->page_ms=110;
+    c->radius=0.44f; c->y_offset=0.10f;
     c->icons=1; c->icon_px=46; c->ui_scale=1.0f; c->font_px=50;
     c->label_px=24; c->title_px=25; c->search_px=20; c->count_px=20;
     c->ssaa=2;
@@ -140,9 +168,12 @@ static void config_set(Config*c,const char*k,const char*v){
     if(!strcmp(k,"width"))c->width=atoi(v);
     else if(!strcmp(k,"height"))c->height=atoi(v);
     else if(!strcmp(k,"fullscreen"))c->fullscreen=atoi(v);
+    else if(!strcmp(k,"close_on_focus_loss"))c->close_on_focus_loss=atoi(v);
     else if(!strcmp(k,"slots"))c->slots=atoi(v);
     else if(!strcmp(k,"arc")||!strcmp(k,"arc_deg"))c->arc_deg=(float)atof(v);
     else if(!strcmp(k,"page_ms"))c->page_ms=atoi(v);
+    else if(!strcmp(k,"radius")||!strcmp(k,"size"))c->radius=(float)atof(v);
+    else if(!strcmp(k,"y_offset")||!strcmp(k,"y"))c->y_offset=(float)atof(v);
     else if(!strcmp(k,"icons"))c->icons=atoi(v);
     else if(!strcmp(k,"icon_px"))c->icon_px=atoi(v);
     else if(!strcmp(k,"ui_scale")||!strcmp(k,"font_scale")||!strcmp(k,"text_scale"))c->ui_scale=(float)atof(v);
@@ -482,7 +513,7 @@ static void resolve_icon(const char*name,char*out,size_t n){
     const char*themes[]={"hicolor","Adwaita","gnome","breeze","Papirus","Humanity",NULL};
     const char*sizes[]={"48x48","64x64","32x32","128x128","256x256","96x96","24x24","scalable",NULL};
     const char*cats[]={"apps","categories","devices","places","status","mimetypes","actions",NULL};
-    const char*exts[]={"png","jpg","bmp",NULL};
+    const char*exts[]={"png","svg","jpg","bmp",NULL};
     char p[PATH_MAX];
     for(int b=0;b<nb;b++)for(int t=0;themes[t];t++)for(int s=0;sizes[s];s++)
         for(int ca=0;cats[ca];ca++)for(int e=0;exts[e];e++){
@@ -505,11 +536,44 @@ static SDL_Texture *load_icon_tex(SDL_Renderer*ren,const char*path){
     if(t){ SDL_SetTextureScaleMode(t,SDL_SCALEMODE_LINEAR); SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND); }
     return t;
 }
+static int ends_with_ci(const char*s,const char*suf){
+    size_t ls=strlen(s),lf=strlen(suf);
+    return ls>=lf && strcasecmp(s+ls-lf,suf)==0;
+}
+/* rasterise an SVG icon to a texture at ~px pixels (aspect preserved) */
+static SDL_Texture *load_svg_tex(SDL_Renderer*ren,const char*path,int px){
+    if(px<16)px=16; if(px>512)px=512;
+    NSVGimage*img=nsvgParseFromFile(path,"px",96.0f);
+    if(!img) return NULL;
+    if(img->width<=0||img->height<=0){ nsvgDelete(img); return NULL; }
+    float big=img->width>img->height?img->width:img->height;
+    float sc=(float)px/big;
+    int ow=(int)(img->width*sc+0.5f), oh=(int)(img->height*sc+0.5f);
+    if(ow<1)ow=1; if(oh<1)oh=1;
+    unsigned char*pix=malloc((size_t)ow*oh*4);
+    NSVGrasterizer*r=nsvgCreateRasterizer();
+    if(!pix||!r){ free(pix); if(r)nsvgDeleteRasterizer(r); nsvgDelete(img); return NULL; }
+    nsvgRasterize(r,img,0,0,sc,pix,ow,oh,ow*4);
+    nsvgDeleteRasterizer(r); nsvgDelete(img);
+    SDL_Surface*s=SDL_CreateSurfaceFrom(ow,oh,SDL_PIXELFORMAT_ABGR8888,pix,ow*4);
+    if(!s){ free(pix); return NULL; }
+    SDL_Texture*t=SDL_CreateTextureFromSurface(ren,s);
+    SDL_DestroySurface(s); free(pix);
+    if(t){ SDL_SetTextureScaleMode(t,SDL_SCALEMODE_LINEAR); SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND); }
+    return t;
+}
 static SDL_Texture *app_icon(SDL_Renderer*ren,App*a,Config*c){
     if(!c->icons) return NULL;
     if(!a->icon_tried){ a->icon_tried=1;
         char path[PATH_MAX]; resolve_icon(a->icon,path,sizeof path);
-        if(*path) a->tex=load_icon_tex(ren,path);
+        if(*path){
+            if(ends_with_ci(path,".svg")){
+                int px=(int)(c->icon_px*c->ui_scale*2.0f); if(px<48)px=48; if(px>256)px=256;
+                a->tex=load_svg_tex(ren,path,px);
+            } else {
+                a->tex=load_icon_tex(ren,path);
+            }
+        }
     }
     return a->tex;
 }
@@ -617,18 +681,21 @@ static void dump_config(void){
 "# --- window ---\n"
 "width=900\n"
 "height=900\n"
-"fullscreen=0\n"
+"fullscreen=1     # cover the screen as a borderless overlay (0 = 900x900 window)\n"
+"close_on_focus_loss=0   # 1 = quit when the window loses focus (dmenu-style)\n"
 "\n"
 "# --- ring layout & paging ---\n"
 "slots=10          # wide, easy-to-hit slots across the TOP arc\n"
 "arc=240           # degrees of the ring used for apps (rest = paging zone)\n"
+"radius=0.44       # wheel size, as a fraction of the shorter screen side\n"
+"y_offset=0.10     # nudge the wheel down (apps sit up top, so this centers it)\n"
 "page_ms=110       # base ms per paged step at the SLOW end. Bigger = calmer\n"
 "                  # start. Paging eases in: slow where you enter the bottom\n"
 "                  # zone, fast toward straight-down.\n"
 "\n"
 "# --- rendering ---\n"
 "ssaa=2            # full-scene supersampling 1..4 (smooths edges). alias: aa\n"
-"icons=1           # show .desktop icons if found (PNG/JPG/BMP)\n"
+"icons=1           # show .desktop icons if found (PNG/SVG/JPG/BMP)\n"
 "icon_px=46        # icon size (before ui_scale)\n"
 "\n"
 "# --- text ---\n"
@@ -693,10 +760,12 @@ static void usage(const char*a0){
 "LAYOUT / INTERACTION\n"
 "  slots=10            wide, easy-to-hit app slots across the top arc\n"
 "  arc=240             degrees of the ring used for apps (rest = paging zone)\n"
+"  radius=0.44         wheel size (fraction of the shorter screen side)\n"
+"  y_offset=0.10       nudge the wheel down so it looks vertically centered\n"
 "  page_ms=110         base ms per paged step; the farther left/right the\n"
 "                      cursor sits in the bottom zone, the faster it pages\n"
 "\n"
-"ICONS  (raster only: PNG/JPG/BMP; SVG-only themes show no icon)\n"
+"ICONS  (PNG, SVG, JPG, BMP)\n"
 "  icons=1             1 = show .desktop icons, 0 = labels only\n"
 "  icon_px=46          icon draw size (before ui_scale)\n"
 "\n"
@@ -712,7 +781,7 @@ static void usage(const char*a0){
 "\n"
 "RENDERING\n"
 "  ssaa=2              full-scene supersampling 1..4 (smooths edges; alias: aa)\n"
-"  width=900 height=900 fullscreen=0\n"
+"  width=900 height=900 fullscreen=1  close_on_focus_loss=0\n"
 "\n"
 "SOURCES / ORDER\n"
 "  An app's \"id\" is just its .desktop filename without the extension:\n"
@@ -797,17 +866,34 @@ int main(int argc,char**argv){
                    apps.v[j].icon?apps.v[j].icon:"-", apps.v[j].terminal?"  [term]":"");
         return 0;
     }
-    if(apps.n==0){ fprintf(stderr,"wheel: no .desktop applications found\n"); return 1; }
+    if(apps.n==0){ fprintf(stderr,"appwheel: no .desktop applications found\n"); return 1; }
+
+    /* Identify as AppWheel so the compositor shows a proper name, and set the
+       Wayland app_id / X11 WM_CLASS so float/center rules match. Before init. */
+    SDL_SetAppMetadata("AppWheel","1.0","org.appwheel.AppWheel");
+    SDL_SetHint(SDL_HINT_APP_ID,"appwheel");
 
     if(!SDL_Init(SDL_INIT_VIDEO)){ fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1; }
+
+    /* "Fullscreen" here means a borderless window the size of the display — a
+       floating overlay, NOT exclusive fullscreen. Exclusive fullscreen makes the
+       surface opaque (black instead of transparent) and causes a mode-switch
+       glitch on close, so we avoid it. */
+    int winw=cfg.width, winh=cfg.height;
+    SDL_Rect dbounds; int have_bounds=0;
+    if(cfg.fullscreen){
+        SDL_DisplayID d=SDL_GetPrimaryDisplay();
+        if(d && SDL_GetDisplayBounds(d,&dbounds)){ winw=dbounds.w; winh=dbounds.h; have_bounds=1; }
+    }
     SDL_WindowFlags wf=SDL_WINDOW_BORDERLESS|SDL_WINDOW_ALWAYS_ON_TOP;
     if(cfg.bg.a<255) wf|=SDL_WINDOW_TRANSPARENT;
-    if(cfg.fullscreen) wf|=SDL_WINDOW_FULLSCREEN;
-    SDL_Window*win=SDL_CreateWindow("appwheel",cfg.width,cfg.height,wf);
+    SDL_Window*win=SDL_CreateWindow("AppWheel",winw,winh,wf);
     if(!win){ fprintf(stderr,"CreateWindow: %s\n",SDL_GetError()); return 1; }
+    if(have_bounds) SDL_SetWindowPosition(win,dbounds.x,dbounds.y);
     SDL_Renderer*ren=SDL_CreateRenderer(win,NULL);
     if(!ren){ fprintf(stderr,"CreateRenderer: %s\n",SDL_GetError()); return 1; }
     SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+    SDL_RaiseWindow(win);
     SDL_StartTextInput(win);
 
     Font font; memset(&font,0,sizeof font);
@@ -828,23 +914,20 @@ int main(int argc,char**argv){
 
     int off=0, selslot=0;                 /* fixed highlight = off+selslot     */
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
-    int paging_armed=0, hotL_prev=0, hotR_prev=0;
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
-    int running=1;
+    int running=1, had_focus=0;
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
 
     SDL_Texture*target=NULL; int tw=0,th=0;
     float ui=cfg.ui_scale;
 
-    /* Use real pointer position at start (important for the “don’t page on open” gating). */
-    SDL_GetMouseState(&mx,&my);
-
     while(running){
         int w,h; SDL_GetWindowSize(win,&w,&h);
         int ss=cfg.ssaa;
-        float cx=w/2.0f,cy=h/2.0f;
-        float R=(w<h?w:h)*0.46f, ri=R*0.46f, rc=ri*0.95f, rl=(R+ri)/2.0f;
+        float mind=(w<h?w:h);
+        float cx=w/2.0f, cy=h/2.0f + cfg.y_offset*mind;
+        float R=mind*cfg.radius, ri=R*0.46f, rc=ri*0.95f, rl=(R+ri)/2.0f;
 
         int vis = fn? (fn<cfg.slots?fn:cfg.slots) : 0;
         int maxoff = fn>vis?fn-vis:0;
@@ -857,12 +940,38 @@ int main(int argc,char**argv){
         float step = arc/(float)(vis>0?vis:1);   /* equal sectors fill the arc */
         float top=-(float)M_PI/2;
         float astart=top-arc/2;
-        float half_arc = arc/2 + 2.0f*(float)DEG;     /* apps fill the arc; page below it */
 
+        /* --- paging: only past the OUTER edge of the end slots; the deeper
+           you go toward straight-down, the FASTER it pages (slow -> fast) --- */
+        float half_arc = arc/2 + 2.0f*(float)DEG;     /* apps fill the arc; page below it */
+        page_dir=0; page_speed=0;
+        { float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
+          if(dist>rc){
+              float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
+              if(fabsf(dtop)>half_arc){               /* truly below the app arc */
+                  page_dir = dtop>0?1:-1;             /* right=forward, left=back */
+                  float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
+                  page_speed = maxd>0?clampf(depth/maxd,0,1):0;
+                  if(fn>vis){
+                      Uint64 now=SDL_GetTicks();
+                      float t=page_speed*page_speed;   /* ease in: gentle start, fast finish */
+                      int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
+                      if((Sint64)(now-last_page)>=iv){
+                          off += page_dir;             /* scroll list; highlight stays put */
+                          if(off<0)off=0;
+                          if(off>maxoff)off=maxoff;
+                          last_page=now;
+                      }
+                  }
+              }
+          }
+        }
 
         SDL_Event ev;
         while(SDL_PollEvent(&ev)){
             if(ev.type==SDL_EVENT_QUIT) running=0;
+            else if(ev.type==SDL_EVENT_WINDOW_FOCUS_GAINED) had_focus=1;
+            else if(ev.type==SDL_EVENT_WINDOW_FOCUS_LOST){ if(cfg.close_on_focus_loss && had_focus) running=0; }
             else if(ev.type==SDL_EVENT_MOUSE_MOTION){
                 mx=ev.motion.x; my=ev.motion.y;
                 float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
@@ -872,27 +981,7 @@ int main(int argc,char**argv){
                         int slot=(int)floorf((dtop+arc/2)/(step>0?step:1));  /* which sector */
                         if(slot<0)slot=0; if(slot>vis-1)slot=vis-1;
                         selslot=slot;
-                        /* Arming condition #1: you hovered an app slot */
-                        if(!paging_armed){ paging_armed=1; last_page=SDL_GetTicks(); }
                     }
-                }
-
-                /* Arming condition #2: you deliberately enter the chevron hotspots.
-                   Requires an *edge* (outside -> inside), so “starting there” won’t arm. */
-                {
-                    float aL=120.0f*(float)DEG, aR=60.0f*(float)DEG;
-                    float lxp=cx+rl*cosf(aL), lyp=cy+rl*sinf(aL);
-                    float rxp=cx+rl*cosf(aR), ryp=cy+rl*sinf(aR);
-                    float hr=32.0f*ui; /* hotspot radius; tweak if you want */
-                    float dlx=mx-lxp, dly=my-lyp;
-                    float drx=mx-rxp, dry=my-ryp;
-                    int hotL = (dlx*dlx + dly*dly) <= hr*hr;
-                    int hotR = (drx*drx + dry*dry) <= hr*hr;
-                    if((!hotL_prev && hotL) || (!hotR_prev && hotR)){
-                        if(!paging_armed){ paging_armed=1; last_page=SDL_GetTicks(); }
-                    }
-                    hotL_prev = hotL;
-                    hotR_prev = hotR;
                 }
             }
             else if(ev.type==SDL_EVENT_MOUSE_WHEEL){
@@ -923,42 +1012,9 @@ int main(int argc,char**argv){
                     if(vis>0){ if(selslot>0)selslot--; else if(off>0)off--; } }
                 else if(k==SDLK_DOWN){ if(maxoff>0){ off+=vis; if(off>maxoff)off=maxoff; } }
                 else if(k==SDLK_UP){ if(maxoff>0){ off-=vis; if(off<0)off=0; } }
-
-                /* If the user moved the highlight via keyboard, consider paging “armed”. */
-                if(k==SDLK_RIGHT||k==SDLK_TAB||k==SDLK_LEFT||k==SDLK_DOWN||k==SDLK_UP){
-                    if(!paging_armed){ paging_armed=1; last_page=SDL_GetTicks(); }
-                }
             }
         }
         if(!running) break;
-
-        /* --- paging (armed) --- */
-        page_dir=0; page_speed=0;
-        if(paging_armed){
-            /* only past the OUTER edge of the end slots; deeper toward straight-down => faster */
-            float half_arc = arc/2 + 2.0f*(float)DEG;
-            float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
-            if(dist>rc){
-                float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
-                if(fabsf(dtop)>half_arc){
-                    page_dir = dtop>0?1:-1;
-                    float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
-                    page_speed = maxd>0?clampf(depth/maxd,0,1):0;
-                    if(fn>vis){
-                        Uint64 now=SDL_GetTicks();
-                        float t=page_speed*page_speed;
-                        int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
-                        if((Sint64)(now-last_page)>=iv){
-                            off += page_dir;
-                            if(off<0)off=0;
-                            if(off>maxoff)off=maxoff;
-                            last_page=now;
-                        }
-                    }
-                }
-            }
-        }
-
 
         /* reclamp after input */
         if(off<0)off=0;
@@ -1018,15 +1074,15 @@ int main(int argc,char**argv){
             float rxp=cx+rl*cosf(aR), ryp=cy+rl*sinf(aR);
             /* left */
             { int on=(page_dir<0); float sp=on?page_speed:0;
-              Col c=on?cfg.accent:cfg.dim; c.a=on?255:150;
+              Col c=on?cfg.accent:cfg.dim; c.a=on?255:210;
               int cnt=1+(on?(int)lroundf(sp*2):0);
-              float s=(10.0f+ (on?10.0f*sp:0))*ui;
+              float s=(19.0f+ (on?13.0f*sp:0))*ui;
               draw_chevrons(ren,lxp,lyp,-1,s,cnt,c); }
             /* right */
             { int on=(page_dir>0); float sp=on?page_speed:0;
-              Col c=on?cfg.accent:cfg.dim; c.a=on?255:150;
+              Col c=on?cfg.accent:cfg.dim; c.a=on?255:210;
               int cnt=1+(on?(int)lroundf(sp*2):0);
-              float s=(10.0f+ (on?10.0f*sp:0))*ui;
+              float s=(19.0f+ (on?13.0f*sp:0))*ui;
               draw_chevrons(ren,rxp,ryp,+1,s,cnt,c); }
         }
 
