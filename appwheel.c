@@ -1,29 +1,11 @@
 /*
- * SPDX-License-Identifier: GPL-2.0-only
- *
  * appwheel — a GTA-V-style radial (weapon-wheel) app launcher for Wayland & X11.
- * Copyright (C) 2025  appwheel contributors
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program (see the LICENSE file); if not, see
- * <https://www.gnu.org/licenses/>.
- *
- * The bundled stb_truetype.h and stb_image.h are public domain, and SDL3 is
- * under the permissive zlib license — both are compatible with GPL-2.0.
  *
  * Dependencies:
  *   - SDL3            (the only library you link)
- *   - stb_truetype.h  (vendored single-header, public domain — smooth fonts)
- *   - stb_image.h     (vendored single-header, public domain — PNG/JPG/BMP icons)
- *   - nanosvg.h + nanosvgrast.h  (vendored single-header, zlib — SVG icons)
+ *   - stb_truetype.h  (vendored single-header — smooth fonts)
+ *   - stb_image.h     (vendored single-header — PNG/JPG/BMP icons)
+ *   - nanosvg.h + nanosvgrast.h  (vendored single-header — SVG icons)
  * The vendored *.h files just sit next to this source; nothing to install/link.
  *
  * Build:
@@ -55,8 +37,8 @@
 #define STBI_ONLY_BMP
 #include "stb_image.h"
 
-/* SVG icons via nanosvg (vendored single-header, zlib license). Third-party
-   headers, so we quiet their warnings without affecting our own -Wall build. */
+/* SVG icons via nanosvg (vendored single-header). Third-party headers, so we
+   quiet their warnings without affecting our own -Wall build. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
@@ -87,6 +69,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 #define DEG (M_PI / 180.0)
+#define ICON_AL (120.0f*(float)DEG)   /* bottom-left paging icon  */
+#define ICON_AR (60.0f*(float)DEG)    /* bottom-right paging icon */
 
 /* ------------------------------------------------------------------ */
 typedef struct { Uint8 r, g, b, a; } Col;
@@ -668,6 +652,15 @@ static void draw_chevrons(SDL_Renderer*r,float x,float y,int dir,float s,int cou
 }
 static float norm_ang(float a){ while(a>M_PI)a-=2*M_PI; while(a<=-M_PI)a+=2*M_PI; return a; }
 
+/* is the cursor on a paging ICON? (used only for the startup arming) */
+static int on_icon(float mx,float my,float cx,float cy,float rl,float hitr){
+    float lx=cx+rl*cosf(ICON_AL), ly=cy+rl*sinf(ICON_AL);
+    float rx=cx+rl*cosf(ICON_AR), ry=cy+rl*sinf(ICON_AR);
+    float h2=hitr*hitr;
+    float a=mx-lx,b=my-ly, c=mx-rx,d=my-ry;
+    return (a*a+b*b<=h2) || (c*c+d*d<=h2);
+}
+
 /* ------------------------------------------------------------------ */
 static void dump_config(void){
     fputs(
@@ -916,7 +909,7 @@ int main(int argc,char**argv){
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
-    int running=1, had_focus=0;
+    int running=1, had_focus=0, page_armed=0, prev_region=0;
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
 
     SDL_Texture*target=NULL; int tw=0,th=0;
@@ -941,14 +934,16 @@ int main(int argc,char**argv){
         float top=-(float)M_PI/2;
         float astart=top-arc/2;
 
-        /* --- paging: only past the OUTER edge of the end slots; the deeper
-           you go toward straight-down, the FASTER it pages (slow -> fast) --- */
+        /* --- paging: hovering anywhere in the bottom zone pages; deeper toward
+           straight-down = faster (slow -> fast). Gated by page_armed so it never
+           fires from wherever the cursor happened to open on (startup safety). --- */
         float half_arc = arc/2 + 2.0f*(float)DEG;     /* apps fill the arc; page below it */
         page_dir=0; page_speed=0;
-        { float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
+        if(page_armed){
+          float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
           if(dist>rc){
               float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
-              if(fabsf(dtop)>half_arc){               /* truly below the app arc */
+              if(fabsf(dtop)>half_arc){               /* below the app arc = paging zone */
                   page_dir = dtop>0?1:-1;             /* right=forward, left=back */
                   float depth=fabsf(dtop)-half_arc, maxd=(float)M_PI-half_arc;
                   page_speed = maxd>0?clampf(depth/maxd,0,1):0;
@@ -957,7 +952,7 @@ int main(int argc,char**argv){
                       float t=page_speed*page_speed;   /* ease in: gentle start, fast finish */
                       int iv=(int)(cfg.page_ms*(1.0f-0.82f*t)); if(iv<24)iv=24;
                       if((Sint64)(now-last_page)>=iv){
-                          off += page_dir;             /* scroll list; highlight stays put */
+                          off += page_dir;
                           if(off<0)off=0;
                           if(off>maxoff)off=maxoff;
                           last_page=now;
@@ -975,14 +970,31 @@ int main(int argc,char**argv){
             else if(ev.type==SDL_EVENT_MOUSE_MOTION){
                 mx=ev.motion.x; my=ev.motion.y;
                 float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
-                if(dist>rc && vis>0){
+                int region=1; float adtop=0;   /* 1=apps/center, 2=bottom off-icon, 3=on icon */
+                if(dist>rc){
                     float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
-                    if(fabsf(dtop)<=half_arc){                /* within the app arc */
-                        int slot=(int)floorf((dtop+arc/2)/(step>0?step:1));  /* which sector */
-                        if(slot<0)slot=0; if(slot>vis-1)slot=vis-1;
-                        selslot=slot;
+                    adtop=fabsf(dtop);
+                    if(adtop<=half_arc){                    /* within the app arc */
+                        if(vis>0){
+                            int slot=(int)floorf((dtop+arc/2)/(step>0?step:1));
+                            if(slot<0)slot=0; if(slot>vis-1)slot=vis-1;
+                            selslot=slot;
+                        }
                     }
+                    else if(on_icon(mx,my,cx,cy,rl,R*0.10f)) region=3;   /* on the icon */
+                    else region=2;                                       /* bottom, off icon */
                 }
+                /* Startup safety (see the 3-state rules):
+                     - reaching the apps/center always arms (state 1)
+                     - approaching the icon from the bottom arms (state 2 -> icon)
+                     - leaving the icon DOWN/SIDEWAYS into the bottom arms; leaving
+                       it UP toward the apps does NOT, so you can pick an app
+                       without scrolling. Once armed, the whole bottom scrolls. */
+                float icon_dtop=fabsf(norm_ang(ICON_AL-top));   /* ~150 deg */
+                if(region==1) page_armed=1;
+                else if(region==3 && prev_region==2) page_armed=1;
+                else if(region==2 && prev_region==3 && adtop>=icon_dtop) page_armed=1;
+                prev_region=region;
             }
             else if(ev.type==SDL_EVENT_MOUSE_WHEEL){
                 int dir=ev.wheel.y>0?-1:(ev.wheel.y<0?1:0);
@@ -1069,7 +1081,7 @@ int main(int argc,char**argv){
 
         /* paging indicators (chevrons) — brighten & multiply with speed */
         if(fn>vis){
-            float aL=120.0f*(float)DEG, aR=60.0f*(float)DEG;   /* bottom-left / -right */
+            float aL=ICON_AL, aR=ICON_AR;   /* bottom-left / -right paging icons */
             float lxp=cx+rl*cosf(aL), lyp=cy+rl*sinf(aL);
             float rxp=cx+rl*cosf(aR), ryp=cy+rl*sinf(aR);
             /* left */
