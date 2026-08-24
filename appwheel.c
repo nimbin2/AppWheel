@@ -499,6 +499,12 @@ static void resolve_icon(const char*name,char*out,size_t n){
     const char*cats[]={"apps","categories","devices","places","status","mimetypes","actions",NULL};
     const char*exts[]={"png","svg","jpg","bmp",NULL};
     char p[PATH_MAX];
+    /* icons dropped directly in an icons dir (not a theme subdir), e.g.
+       ~/.local/share/icons/duckduckgo.svg — check these first */
+    for(int b=0;b<nb;b++)for(int e=0;exts[e];e++){
+        snprintf(p,sizeof p,"%.3500s/%.400s.%s",bases[b],name,exts[e]);
+        if(file_exists(p)){ snprintf(out,n,"%s",p); return; }
+    }
     for(int b=0;b<nb;b++)for(int t=0;themes[t];t++)for(int s=0;sizes[s];s++)
         for(int ca=0;cats[ca];ca++)for(int e=0;exts[e];e++){
             snprintf(p,sizeof p,"%.3500s/%s/%s/%s/%.400s.%s",bases[b],themes[t],sizes[s],cats[ca],name,exts[e]);
@@ -1018,9 +1024,9 @@ int main(int argc,char**argv){
                 else if(k==SDLK_RETURN||k==SDLK_KP_ENTER){ if(fn){ launch(&apps.v[filt[sel]],&cfg); running=0; } }
                 else if(k==SDLK_BACKSPACE){ int L=strlen(query);
                     if(L>0){ L--; while(L>0&&((unsigned char)query[L]&0xC0)==0x80)L--; query[L]='\0'; REBUILD();off=0;selslot=0; } }
-                else if(k==SDLK_RIGHT||k==SDLK_TAB){
+                else if(k==SDLK_RIGHT || (k==SDLK_TAB && !(ev.key.mod&SDL_KMOD_SHIFT))){
                     if(vis>0){ if(selslot<vis-1)selslot++; else if(off<maxoff)off++; } }
-                else if(k==SDLK_LEFT){
+                else if(k==SDLK_LEFT || (k==SDLK_TAB && (ev.key.mod&SDL_KMOD_SHIFT))){
                     if(vis>0){ if(selslot>0)selslot--; else if(off>0)off--; } }
                 else if(k==SDLK_DOWN){ if(maxoff>0){ off+=vis; if(off>maxoff)off=maxoff; } }
                 else if(k==SDLK_UP){ if(maxoff>0){ off-=vis; if(off<0)off=0; } }
