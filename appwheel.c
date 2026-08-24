@@ -127,7 +127,7 @@ typedef struct {
 static void config_defaults(Config*c){
     memset(c,0,sizeof *c);
     c->width=900; c->height=900; c->fullscreen=1; c->close_on_focus_loss=0;
-    c->slots=10; c->arc_deg=240.0f; c->page_ms=110;
+    c->slots=11; c->arc_deg=240.0f; c->page_ms=110;
     c->radius=0.44f; c->y_offset=0.10f;
     c->icons=1; c->icon_px=46; c->ui_scale=1.0f; c->font_px=50;
     c->label_px=24; c->title_px=25; c->search_px=20; c->count_px=20;
@@ -481,6 +481,56 @@ static void apply_recency(AppList*l,Config*c){
     memcpy(l->v,ord,l->n*sizeof*l->v); free(ord); free(used);
 }
 
+/* Search ordering: split matches into "direct" (query starts a word in the name)
+   and "close" (query only appears mid-word), then lay them out so the best match
+   sits at the TOP, direct matches fan to the RIGHT, close matches to the LEFT.
+   Fills filt[] and picks off/selslot so the best is centered (at the top). */
+static int is_sep(char c){ return c==' '||c=='-'||c=='_'||c=='.'||c=='/'||c==':'; }
+static int match_kind(const char*name,const char*q,size_t ql){
+    int ws=1;
+    for(const char*p=name;*p;p++){
+        if(ws && strncasecmp(p,q,ql)==0) return 0;     /* word-start match -> direct */
+        ws=is_sep(*p);
+    }
+    return contains_ci(name,q)?1:-1;                    /* mid-word substring -> close */
+}
+static int build_filter(AppList*apps,const char*query,int*filt,int slots,int*p_off,int*p_selslot){
+    int fn=0;
+    if(!query[0]){                                      /* no query: all apps, in order */
+        for(int i=0;i<apps->n;i++) filt[fn++]=i;
+        *p_off=0; *p_selslot=0; return fn;
+    }
+    size_t ql=strlen(query);
+    int *dir=malloc(apps->n*sizeof(int)), *clo=malloc(apps->n*sizeof(int));
+    int nd=0,nc=0;
+    if(dir&&clo) for(int i=0;i<apps->n;i++){
+        int k=match_kind(apps->v[i].name,query,ql);
+        if(k==0) dir[nd++]=i; else if(k==1) clo[nc++]=i;
+    }
+    fn=nd+nc;
+    if(fn<=0){ free(dir);free(clo); *p_off=0;*p_selslot=0; return 0; }
+    int best,*right,nr,*left,nl;
+    if(nd>0){ best=dir[0]; right=dir+1; nr=nd-1; left=clo;   nl=nc;   }
+    else    { best=clo[0]; right=clo;   nr=0;    left=clo+1; nl=nc-1; }
+    int c=(fn-1)/2;                                     /* best sits at the array centre */
+    filt[c]=best;
+    int rp=0,lp=0;
+    for(int ri=c+1; ri<fn; ri++){                      /* right of centre: direct, then overflow */
+        if(rp<nr) filt[ri]=right[rp++]; else if(lp<nl) filt[ri]=left[lp++];
+    }
+    for(int li=c-1; li>=0; li--){                      /* left of centre: close, then overflow */
+        if(lp<nl) filt[li]=left[lp++]; else if(rp<nr) filt[li]=right[rp++];
+    }
+    free(dir); free(clo);
+    int vis = fn<slots?fn:slots; if(vis<1)vis=1;
+    if(vis>=4 && (vis&1)==0) vis--;                     /* odd -> best lands at the exact top */
+    int maxoff = fn>vis?fn-vis:0;
+    int off = c-(vis-1)/2; if(off<0)off=0; if(off>maxoff)off=maxoff;
+    int ss = c-off; if(ss<0)ss=0; if(ss>vis-1)ss=vis-1;
+    *p_off=off; *p_selslot=ss;
+    return fn;
+}
+
 /* ------------------------------------------------------------------ */
 /* icons                                                               */
 /* ------------------------------------------------------------------ */
@@ -684,7 +734,7 @@ static void dump_config(void){
 "close_on_focus_loss=0   # 1 = quit when the window loses focus (dmenu-style)\n"
 "\n"
 "# --- ring layout & paging ---\n"
-"slots=10          # wide, easy-to-hit slots across the TOP arc\n"
+"slots=11          # wide, easy-to-hit slots across the TOP arc\n"
 "arc=240           # degrees of the ring used for apps (rest = paging zone)\n"
 "radius=0.44       # wheel size, as a fraction of the shorter screen side\n"
 "y_offset=0.10     # nudge the wheel down (apps sit up top, so this centers it)\n"
@@ -757,7 +807,7 @@ static void usage(const char*a0){
 "  -h, --help          show this help and exit\n"
 "\n"
 "LAYOUT / INTERACTION\n"
-"  slots=10            wide, easy-to-hit app slots across the top arc\n"
+"  slots=11            wide, easy-to-hit app slots across the top arc\n"
 "  arc=240             degrees of the ring used for apps (rest = paging zone)\n"
 "  radius=0.44         wheel size (fraction of the shorter screen side)\n"
 "  y_offset=0.10       nudge the wheel down so it looks vertically centered\n"
@@ -908,10 +958,10 @@ int main(int argc,char**argv){
     if(!font.ok) fprintf(stderr,"appwheel: no usable TTF font found; using built-in font\n");
 
     int *filt=malloc(apps.n*sizeof*filt); int fn=0; char query[256]={0};
-    #define REBUILD() do{ fn=0; for(int i=0;i<apps.n;i++) if(contains_ci(apps.v[i].name,query)) filt[fn++]=i; }while(0)
+    int off=0, selslot=0;                 /* fixed highlight = off+selslot     */
+    #define REBUILD() do{ fn=build_filter(&apps,query,filt,cfg.slots,&off,&selslot); }while(0)
     REBUILD();
 
-    int off=0, selslot=0;                 /* fixed highlight = off+selslot     */
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
@@ -928,7 +978,9 @@ int main(int argc,char**argv){
         float cx=w/2.0f, cy=h/2.0f + cfg.y_offset*mind;
         float R=mind*cfg.radius, ri=R*0.46f, rc=ri*0.95f, rl=(R+ri)/2.0f;
 
+        int searching = query[0]!=0;
         int vis = fn? (fn<cfg.slots?fn:cfg.slots) : 0;
+        if(searching && vis>=4 && (vis&1)==0) vis--;   /* odd count -> a real top slot, balanced sides */
         int maxoff = fn>vis?fn-vis:0;
         if(off<0)off=0;
         if(off>maxoff)off=maxoff;
@@ -982,7 +1034,7 @@ int main(int argc,char**argv){
                     adtop=fabsf(dtop);
                     if(adtop<=half_arc){                    /* within the app arc */
                         if(vis>0){
-                            int slot=(int)floorf((dtop+arc/2)/(step>0?step:1));
+                            int slot = (int)floorf((dtop+arc/2)/(step>0?step:1));
                             if(slot<0)slot=0; if(slot>vis-1)slot=vis-1;
                             selslot=slot;
                         }
@@ -1016,14 +1068,14 @@ int main(int argc,char**argv){
             }
             else if(ev.type==SDL_EVENT_TEXT_INPUT){
                 strncat(query,ev.text.text,sizeof query-strlen(query)-1);
-                REBUILD(); off=0; selslot=0;
+                REBUILD();
             }
             else if(ev.type==SDL_EVENT_KEY_DOWN){
                 SDL_Keycode k=ev.key.key;
-                if(k==SDLK_ESCAPE){ if(query[0]){query[0]='\0';REBUILD();off=0;selslot=0;} else running=0; }
+                if(k==SDLK_ESCAPE){ if(query[0]){query[0]='\0';REBUILD();} else running=0; }
                 else if(k==SDLK_RETURN||k==SDLK_KP_ENTER){ if(fn){ launch(&apps.v[filt[sel]],&cfg); running=0; } }
                 else if(k==SDLK_BACKSPACE){ int L=strlen(query);
-                    if(L>0){ L--; while(L>0&&((unsigned char)query[L]&0xC0)==0x80)L--; query[L]='\0'; REBUILD();off=0;selslot=0; } }
+                    if(L>0){ L--; while(L>0&&((unsigned char)query[L]&0xC0)==0x80)L--; query[L]='\0'; REBUILD(); } }
                 else if(k==SDLK_RIGHT || (k==SDLK_TAB && !(ev.key.mod&SDL_KMOD_SHIFT))){
                     if(vis>0){ if(selslot<vis-1)selslot++; else if(off<maxoff)off++; } }
                 else if(k==SDLK_LEFT || (k==SDLK_TAB && (ev.key.mod&SDL_KMOD_SHIFT))){
@@ -1060,7 +1112,7 @@ int main(int argc,char**argv){
         float label_px=cfg.label_px*ui;
         for(int i=0;i<vis;i++){
             int item=filt[off+i];
-            float a=astart+(i+0.5f)*step;
+            float a = astart+(i+0.5f)*step;
             float a0=a-slotw/2+0.010f, a1=a+slotw/2-0.010f;
             int hot=(off+i==sel);
             Col scol=hot?cfg.hl:(i&1?cfg.ring2:cfg.ring);
