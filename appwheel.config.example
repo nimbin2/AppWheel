@@ -12,7 +12,7 @@ fullscreen=1     # cover the screen as a borderless overlay (0 = 900x900 window)
 close_on_focus_loss=0   # 1 = quit when the window loses focus (dmenu-style)
 
 # --- ring layout & paging ---
-slots=10          # wide, easy-to-hit slots across the TOP arc
+slots=11          # wide, easy-to-hit slots across the TOP arc
 arc=240           # degrees of the ring used for apps (rest = paging zone)
 radius=0.44       # wheel size, as a fraction of the shorter screen side
 y_offset=0.10     # nudge the wheel down (apps sit up top, so this centers it)
@@ -22,6 +22,8 @@ page_ms=110       # base ms per paged step at the SLOW end. Bigger = calmer
 
 # --- rendering ---
 ssaa=2            # full-scene supersampling 1..4 (smooths edges). alias: aa
+animate=1         # subtle settle animation when the search results change
+anim_ms=90        # its duration (0 or animate=0 to turn it off)
 icons=1           # show .desktop icons if found (PNG/SVG/JPG/BMP)
 icon_px=46        # icon size (before ui_scale)
 

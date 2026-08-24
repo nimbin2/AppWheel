@@ -80,8 +80,14 @@ Usage
   Enter or left-click                launch
   Esc                                clear the filter, or quit
   Right-click                        quit
+  Tab / Shift+Tab                    next / previous
 
   Apps you launch are remembered and shown first next time.
+
+  As a dmenu-style picker (like dmenu/bemenu/wofi), feed items on stdin and read
+  the choice from stdout:
+
+      printf 'Log Out\nReboot\nShutdown' | appwheel --dmenu
 
 
 Configuration

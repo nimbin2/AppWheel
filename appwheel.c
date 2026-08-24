@@ -118,6 +118,7 @@ typedef struct {
     float ui_scale; int font_px;
     float label_px, title_px, search_px, count_px;   /* per-element text sizes */
     int   ssaa;                       /* full-scene supersample (1..4) */
+    int   animate, anim_ms;           /* app-data crossfade on results change */
     char  font[PATH_MAX];
     char  sort[16], launcher[16], terminal[128];
     char  history[PATH_MAX], dirs[4096], include[8192], exclude[8192];
@@ -132,6 +133,7 @@ static void config_defaults(Config*c){
     c->icons=1; c->icon_px=46; c->ui_scale=1.0f; c->font_px=50;
     c->label_px=24; c->title_px=25; c->search_px=20; c->count_px=20;
     c->ssaa=2;
+    c->animate=1; c->anim_ms=90;
     strcpy(c->sort,"recent"); strcpy(c->launcher,"sh");
     const char*term=getenv("TERMINAL");
     snprintf(c->terminal,sizeof c->terminal,"%s",term?term:"xterm");
@@ -167,6 +169,8 @@ static void config_set(Config*c,const char*k,const char*v){
     else if(!strcmp(k,"search_px")||!strcmp(k,"query_px"))c->search_px=(float)atof(v);
     else if(!strcmp(k,"count_px"))c->count_px=(float)atof(v);
     else if(!strcmp(k,"ssaa")||!strcmp(k,"aa"))c->ssaa=atoi(v);
+    else if(!strcmp(k,"animate"))c->animate=atoi(v);
+    else if(!strcmp(k,"anim_ms"))c->anim_ms=atoi(v);
     else if(!strcmp(k,"font"))snprintf(c->font,sizeof c->font,"%s",v);
     else if(!strcmp(k,"sort"))snprintf(c->sort,sizeof c->sort,"%s",v);
     else if(!strcmp(k,"launcher"))snprintf(c->launcher,sizeof c->launcher,"%s",v);
@@ -486,13 +490,23 @@ static void apply_recency(AppList*l,Config*c){
    sits at the TOP, direct matches fan to the RIGHT, close matches to the LEFT.
    Fills filt[] and picks off/selslot so the best is centered (at the top). */
 static int is_sep(char c){ return c==' '||c=='-'||c=='_'||c=='.'||c=='/'||c==':'; }
-static int match_kind(const char*name,const char*q,size_t ql){
+/* match quality: 0 exact, 1 whole-name prefix, 2 word-start, 3 mid-word, -1 none */
+static int match_tier(const char*name,const char*q,size_t ql){
+    if(!strcasecmp(name,q)) return 0;
+    if(!strncasecmp(name,q,ql)) return 1;
     int ws=1;
     for(const char*p=name;*p;p++){
-        if(ws && strncasecmp(p,q,ql)==0) return 0;     /* word-start match -> direct */
+        if(ws && !strncasecmp(p,q,ql)) return 2;
         ws=is_sep(*p);
     }
-    return contains_ci(name,q)?1:-1;                    /* mid-word substring -> close */
+    return contains_ci(name,q)?3:-1;
+}
+typedef struct { int idx,tier,len; } Match;
+static int match_cmp(const void*a,const void*b){
+    const Match*x=a,*y=b;
+    if(x->tier!=y->tier) return x->tier-y->tier;       /* better tier first */
+    if(x->len !=y->len ) return x->len -y->len;         /* shorter (closer) first */
+    return x->idx-y->idx;                               /* then recency */
 }
 static int build_filter(AppList*apps,const char*query,int*filt,int slots,int*p_off,int*p_selslot){
     int fn=0;
@@ -501,12 +515,25 @@ static int build_filter(AppList*apps,const char*query,int*filt,int slots,int*p_o
         *p_off=0; *p_selslot=0; return fn;
     }
     size_t ql=strlen(query);
-    int *dir=malloc(apps->n*sizeof(int)), *clo=malloc(apps->n*sizeof(int));
-    int nd=0,nc=0;
-    if(dir&&clo) for(int i=0;i<apps->n;i++){
-        int k=match_kind(apps->v[i].name,query,ql);
-        if(k==0) dir[nd++]=i; else if(k==1) clo[nc++]=i;
+    Match *m=malloc(apps->n*sizeof(Match)); int nm=0;
+    if(m) for(int i=0;i<apps->n;i++){
+        const char*nm_s=apps->v[i].name, *id_s=apps->v[i].id;
+        int tn=match_tier(nm_s,query,ql);                      /* match on the name ... */
+        int ti=id_s?match_tier(id_s,query,ql):-1;              /* ...or the id */
+        int t = tn<0?ti : (ti<0?tn : (tn<ti?tn:ti));           /* best of the two */
+        if(t<0) continue;
+        int mlen=1<<30;                                        /* shortest string that hit that tier */
+        if(tn==t){ int l=(int)strlen(nm_s); if(l<mlen)mlen=l; }
+        if(ti==t){ int l=(int)strlen(id_s); if(l<mlen)mlen=l; }
+        m[nm].idx=i; m[nm].tier=t; m[nm].len=mlen; nm++;
     }
+    if(nm>1) qsort(m,nm,sizeof(Match),match_cmp);       /* best-ranked first */
+    int *dir=malloc(nm*sizeof(int)+1), *clo=malloc(nm*sizeof(int)+1);
+    int nd=0,nc=0;
+    if(dir&&clo) for(int j=0;j<nm;j++){                 /* keep ranked order within each group */
+        if(m[j].tier<3) dir[nd++]=m[j].idx; else clo[nc++]=m[j].idx;
+    }
+    free(m);
     fn=nd+nc;
     if(fn<=0){ free(dir);free(clo); *p_off=0;*p_selslot=0; return 0; }
     int best,*right,nr,*left,nl;
@@ -744,6 +771,8 @@ static void dump_config(void){
 "\n"
 "# --- rendering ---\n"
 "ssaa=2            # full-scene supersampling 1..4 (smooths edges). alias: aa\n"
+"animate=1         # crossfade app names/icons when results change\n"
+"anim_ms=90        # its duration (0 or animate=0 to turn it off)\n"
 "icons=1           # show .desktop icons if found (PNG/SVG/JPG/BMP)\n"
 "icon_px=46        # icon size (before ui_scale)\n"
 "\n"
@@ -804,6 +833,8 @@ static void usage(const char*a0){
 "      --dump-config   print a commented default config (redirect to save it):\n"
 "                        appwheel --dump-config > ~/.config/appwheel/config\n"
 "      --list          print discovered apps (with resolved icon) and exit\n"
+"  -d, --dmenu         read newline-separated items from stdin, print the chosen\n"
+"                      one to stdout (a dmenu/bemenu/wofi-style picker)\n"
 "  -h, --help          show this help and exit\n"
 "\n"
 "LAYOUT / INTERACTION\n"
@@ -830,6 +861,7 @@ static void usage(const char*a0){
 "\n"
 "RENDERING\n"
 "  ssaa=2              full-scene supersampling 1..4 (smooths edges; alias: aa)\n"
+"  animate=1 anim_ms=90  crossfade names/icons when results change (0 = off)\n"
 "  width=900 height=900 fullscreen=1  close_on_focus_loss=0\n"
 "\n"
 "SOURCES / ORDER\n"
@@ -876,19 +908,20 @@ int main(int argc,char**argv){
     if(xc&&*xc) snprintf(cfgpath,sizeof cfgpath,"%s/appwheel/config",xc);
     else snprintf(cfgpath,sizeof cfgpath,"%s/.config/appwheel/config",home?home:".");
 
-    int want_list=0;
+    int want_list=0, dmenu=0;
     for(int i=1;i<argc;i++){
         if((!strcmp(argv[i],"-c")||!strcmp(argv[i],"--config"))&&i+1<argc)
             snprintf(cfgpath,sizeof cfgpath,"%s",argv[++i]);
         else if(!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")){ usage(argv[0]); return 0; }
         else if(!strcmp(argv[i],"--dump-config")){ dump_config(); return 0; }
         else if(!strcmp(argv[i],"--list")) want_list=1;
+        else if(!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")) dmenu=1;
     }
     { char tmp[PATH_MAX]; expand_tilde(cfgpath,tmp,sizeof tmp); snprintf(cfgpath,sizeof cfgpath,"%s",tmp); }
     config_load(&cfg,cfgpath);
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"-c")||!strcmp(argv[i],"--config")){ i++; continue; }
-        if(!strcmp(argv[i],"--list")||!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")||!strcmp(argv[i],"--dump-config")) continue;
+        if(!strcmp(argv[i],"--list")||!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")||!strcmp(argv[i],"--dump-config")||!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")) continue;
         char*a=argv[i]; while(*a=='-') a++;            /* accept --key=value too */
         char*eq=strchr(a,'='); if(eq){ *eq='\0'; config_set(&cfg,a,eq+1); }
     }
@@ -899,15 +932,23 @@ int main(int argc,char**argv){
       if(*cfg.font){ expand_tilde(cfg.font,tmp,sizeof tmp); snprintf(cfg.font,sizeof cfg.font,"%s",tmp); } }
 
     AppList apps={0};
-    if(*cfg.dirs){ char*copy=xstrdup(cfg.dirs),*tok=strtok(copy,":");
+    if(dmenu){                                     /* dmenu mode: items come from stdin */
+        char line[8192];
+        while(fgets(line,sizeof line,stdin)){
+            size_t L=strlen(line);
+            while(L && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
+            App a; memset(&a,0,sizeof a);
+            a.id=xstrdup(line); a.name=xstrdup(line);
+            applist_push(&apps,a);                 /* input order preserved */
+        }
+    } else if(*cfg.dirs){ char*copy=xstrdup(cfg.dirs),*tok=strtok(copy,":");
         while(tok){ char d[PATH_MAX]; expand_tilde(tok,d,sizeof d); scan_dir(&apps,d); tok=strtok(NULL,":"); }
         free(copy);
     } else {
         char dirs[64][PATH_MAX]; int nd=0; collect_default_dirs(dirs,&nd,64);
         for(int i=0;i<nd;i++) scan_dir(&apps,dirs[i]);
     }
-    apply_config_order(&apps,&cfg);
-    apply_recency(&apps,&cfg);
+    if(!dmenu){ apply_config_order(&apps,&cfg); apply_recency(&apps,&cfg); }
 
     if(want_list){
         for(int j=0;j<apps.n;j++)
@@ -915,7 +956,7 @@ int main(int argc,char**argv){
                    apps.v[j].icon?apps.v[j].icon:"-", apps.v[j].terminal?"  [term]":"");
         return 0;
     }
-    if(apps.n==0){ fprintf(stderr,"appwheel: no .desktop applications found\n"); return 1; }
+    if(apps.n==0){ fprintf(stderr,"appwheel: no %s\n", dmenu?"input on stdin":".desktop applications found"); return 1; }
 
     /* Identify as AppWheel so the compositor shows a proper name, and set the
        Wayland app_id / X11 WM_CLASS so float/center rules match. Before init. */
@@ -959,13 +1000,16 @@ int main(int argc,char**argv){
 
     int *filt=malloc(apps.n*sizeof*filt); int fn=0; char query[256]={0};
     int off=0, selslot=0;                 /* fixed highlight = off+selslot     */
-    #define REBUILD() do{ fn=build_filter(&apps,query,filt,cfg.slots,&off,&selslot); }while(0)
+    Uint64 anim0=0;                       /* time of last filter change (animation) */
+    #define REBUILD() do{ fn=build_filter(&apps,query,filt,cfg.slots,&off,&selslot); anim0=SDL_GetTicks(); }while(0)
     REBUILD();
 
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
-    int running=1, had_focus=0, page_armed=0, prev_region=0;
+    int running=1, had_focus=0, page_armed=0, prev_region=0, chose=0;
+    #define CHOOSE() do{ if(dmenu){ printf("%s\n",apps.v[filt[sel]].name); fflush(stdout); chose=1; } \
+                         else launch(&apps.v[filt[sel]],&cfg); running=0; }while(0)
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
 
     SDL_Texture*target=NULL; int tw=0,th=0;
@@ -1063,7 +1107,7 @@ int main(int argc,char**argv){
                 }
             }
             else if(ev.type==SDL_EVENT_MOUSE_BUTTON_DOWN){
-                if(ev.button.button==SDL_BUTTON_LEFT&&fn){ launch(&apps.v[filt[sel]],&cfg); running=0; }
+                if(ev.button.button==SDL_BUTTON_LEFT&&fn){ CHOOSE(); }
                 else if(ev.button.button==SDL_BUTTON_RIGHT) running=0;
             }
             else if(ev.type==SDL_EVENT_TEXT_INPUT){
@@ -1073,7 +1117,7 @@ int main(int argc,char**argv){
             else if(ev.type==SDL_EVENT_KEY_DOWN){
                 SDL_Keycode k=ev.key.key;
                 if(k==SDLK_ESCAPE){ if(query[0]){query[0]='\0';REBUILD();} else running=0; }
-                else if(k==SDLK_RETURN||k==SDLK_KP_ENTER){ if(fn){ launch(&apps.v[filt[sel]],&cfg); running=0; } }
+                else if(k==SDLK_RETURN||k==SDLK_KP_ENTER){ if(fn){ CHOOSE(); } }
                 else if(k==SDLK_BACKSPACE){ int L=strlen(query);
                     if(L>0){ L--; while(L>0&&((unsigned char)query[L]&0xC0)==0x80)L--; query[L]='\0'; REBUILD(); } }
                 else if(k==SDLK_RIGHT || (k==SDLK_TAB && !(ev.key.mod&SDL_KMOD_SHIFT))){
@@ -1086,12 +1130,19 @@ int main(int argc,char**argv){
         }
         if(!running) break;
 
-        /* reclamp after input */
+        /* Input above may have changed fn/off/selslot (typing, backspace, paging),
+           so recompute the whole layout before rendering — otherwise this frame
+           would draw with the previous match count and the highlight flickers. */
+        searching = query[0]!=0;
+        vis = fn? (fn<cfg.slots?fn:cfg.slots) : 0;
+        if(searching && vis>=4 && (vis&1)==0) vis--;
+        maxoff = fn>vis?fn-vis:0;
         if(off<0)off=0;
         if(off>maxoff)off=maxoff;
-        if(vis>0){ if(selslot>vis-1)selslot=vis-1; if(selslot<0)selslot=0; }
+        if(vis>0){ if(selslot<0)selslot=0; if(selslot>vis-1)selslot=vis-1; }
         sel = fn? off+selslot : 0;
         if(sel>fn-1)sel=fn-1;
+        step = arc/(float)(vis>0?vis:1);
 
         /* -------------------- render (optionally supersampled) ------------- */
         if(ss>1){
@@ -1110,16 +1161,22 @@ int main(int argc,char**argv){
 
         float slotw=step;
         float label_px=cfg.label_px*ui;
+        /* app-data crossfade: on a results change, the names/icons/highlight text
+           fade back in while the ring sectors (background) stay put — smooths fast
+           typing without delaying anything. */
+        float af = (cfg.animate && cfg.anim_ms>0)
+                   ? clampf(0.30f + 0.70f*(float)(SDL_GetTicks()-anim0)/(float)cfg.anim_ms, 0.0f, 1.0f) : 1.0f;
+        Uint8 fa = (Uint8)(255*af);
         for(int i=0;i<vis;i++){
             int item=filt[off+i];
             float a = astart+(i+0.5f)*step;
             float a0=a-slotw/2+0.010f, a1=a+slotw/2-0.010f;
             int hot=(off+i==sel);
             Col scol=hot?cfg.hl:(i&1?cfg.ring2:cfg.ring);
-            fill_sector(ren,cx,cy,ri,R,a0,a1,scol);
+            fill_sector(ren,cx,cy,ri,R,a0,a1,scol);            /* sector stays solid */
 
             float lx=cx+rl*cosf(a), ly=cy+rl*sinf(a);
-            Col tc=hot?cfg.hltext:cfg.text;
+            Col tc=hot?cfg.hltext:cfg.text; tc.a=(Uint8)(tc.a*af);   /* text fades */
             float chord=2*rl*sinf(slotw/2)*0.84f;
             char lbl[160]; fit_label(&font,label_px,apps.v[item].name,chord,lbl,sizeof lbl);
 
@@ -1130,6 +1187,7 @@ int main(int argc,char**argv){
                 float blockH=isz+gap+label_px;
                 float topy=ly-blockH/2;
                 SDL_FRect dst={lx-isz/2, topy, isz, isz};
+                SDL_SetTextureAlphaMod(ic,fa);           /* icon fades */
                 SDL_RenderTexture(ren,ic,NULL,&dst);
                 text_centered(ren,&font,lx, topy+isz+gap+label_px/2, label_px, tc, lbl);
             } else {
@@ -1167,9 +1225,11 @@ int main(int argc,char**argv){
 
         if(fn){
             char nm[200]; fit_label(&font,cfg.title_px*ui,apps.v[filt[sel]].name,rc*1.7f,nm,sizeof nm);
-            text_centered(ren,&font,cx,cy,cfg.title_px*ui,cfg.text,nm);
+            Col nmc=cfg.text; nmc.a=(Uint8)(nmc.a*af);
+            text_centered(ren,&font,cx,cy,cfg.title_px*ui,nmc,nm);
             char cnt[64]; snprintf(cnt,sizeof cnt,"%d / %d",sel+1,fn);
-            text_centered(ren,&font,cx,cy+rc*0.40f,cfg.count_px*ui,cfg.dim,cnt);
+            Col cc=cfg.dim; cc.a=(Uint8)(cc.a*af);
+            text_centered(ren,&font,cx,cy+rc*0.40f,cfg.count_px*ui,cc,cnt);
         } else {
             text_centered(ren,&font,cx,cy,cfg.title_px*ui,cfg.dim,"no matches");
         }
@@ -1179,7 +1239,7 @@ int main(int argc,char**argv){
             SDL_SetRenderTarget(ren,NULL);
             SDL_SetRenderDrawColor(ren,0,0,0,0);
             SDL_RenderClear(ren);
-            SDL_RenderTexture(ren,target,NULL,NULL);
+            SDL_RenderTexture(ren,target,NULL,NULL);     /* fade is per-element now */
         }
         SDL_RenderPresent(ren);
         SDL_Delay(16);
@@ -1190,5 +1250,5 @@ int main(int argc,char**argv){
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    return 0;
+    return (dmenu && !chose) ? 1 : 0;   /* dmenu convention: non-zero on cancel */
 }
