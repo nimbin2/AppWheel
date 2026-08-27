@@ -37,6 +37,15 @@
 #define STBI_ONLY_BMP
 #include "stb_image.h"
 
+#include "sw_theme.h"
+
+#define APP_ID "appwheel"          /* wayland app_id / X11 WM_CLASS */
+
+#define APPWHEEL_VERSION "1.1"
+#ifndef APPWHEEL_BUILD             /* set by the Makefile: md5 of this file */
+#define APPWHEEL_BUILD "unknown"
+#endif
+
 /* SVG icons via nanosvg (vendored single-header). Third-party headers, so we
    quiet their warnings without affecting our own -Wall build. */
 #pragma GCC diagnostic push
@@ -63,6 +72,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
+#include <stdarg.h>
 #include <limits.h>
 
 #ifndef M_PI
@@ -123,6 +135,16 @@ typedef struct {
     char  font[PATH_MAX];
     char  sort[16], launcher[16], terminal[128];
     char  history[PATH_MAX], dirs[4096], include[8192], exclude[8192];
+    int   drop;                       /* drag an app onto a workspace: 0 = off */
+    int   overview;                   /* 1 = swov behind the wheel as the target */
+    int   overview_debug;             /* narrate the backdrop conversation      */
+    float drop_shrink;                /* how small the wheel gets while dragging */
+    int   drop_ms, drop_px, drop_focus;
+    int   drop_close_here;            /* dropped on the workspace we are on:
+                                         close, or the app opens behind us   */
+    char  drop_corner[16];            /* where the wheel goes while dragging:
+                                         top-left, top-right, or none        */
+    char  swov[PATH_MAX];             /* the binary that knows about sway */
     Col bg,ring,ring2,hl,text,hltext,center,accent,dim;
 } Config;
 
@@ -135,6 +157,10 @@ static void config_defaults(Config*c){
     c->label_px=24; c->title_px=25; c->search_px=20; c->count_px=20;
     c->ssaa=2;
     c->animate=1; c->anim_ms=90; c->recent_first=1;
+    c->drop=1; c->drop_shrink=0.55f; c->drop_ms=130; c->drop_px=10; c->drop_focus=0;
+    c->overview=0; c->overview_debug=0; c->drop_close_here=0;
+    strcpy(c->drop_corner,"top-left");
+    strcpy(c->swov,"swov");
     strcpy(c->sort,"recent"); strcpy(c->launcher,"sh");
     const char*term=getenv("TERMINAL");
     snprintf(c->terminal,sizeof c->terminal,"%s",term?term:"xterm");
@@ -173,6 +199,16 @@ static void config_set(Config*c,const char*k,const char*v){
     else if(!strcmp(k,"animate"))c->animate=atoi(v);
     else if(!strcmp(k,"anim_ms"))c->anim_ms=atoi(v);
     else if(!strcmp(k,"recent_first"))c->recent_first=atoi(v);
+    else if(!strcmp(k,"drop"))c->drop=atoi(v);
+    else if(!strcmp(k,"overview"))c->overview=atoi(v);
+    else if(!strcmp(k,"overview_debug"))c->overview_debug=atoi(v);
+    else if(!strcmp(k,"drop_close_here"))c->drop_close_here=atoi(v);
+    else if(!strcmp(k,"drop_corner"))snprintf(c->drop_corner,sizeof c->drop_corner,"%s",v);
+    else if(!strcmp(k,"drop_shrink"))c->drop_shrink=(float)atof(v);
+    else if(!strcmp(k,"drop_ms"))c->drop_ms=atoi(v);
+    else if(!strcmp(k,"drop_px"))c->drop_px=atoi(v);
+    else if(!strcmp(k,"drop_focus"))c->drop_focus=atoi(v);
+    else if(!strcmp(k,"swov"))snprintf(c->swov,sizeof c->swov,"%s",v);
     else if(!strcmp(k,"font"))snprintf(c->font,sizeof c->font,"%s",v);
     else if(!strcmp(k,"sort"))snprintf(c->sort,sizeof c->sort,"%s",v);
     else if(!strcmp(k,"launcher"))snprintf(c->launcher,sizeof c->launcher,"%s",v);
@@ -192,13 +228,33 @@ static void config_set(Config*c,const char*k,const char*v){
     else if(!strcmp(k,"dim"))parse_color(v,&c->dim);
     else fprintf(stderr,"wheel: unknown key '%s'\n",k);
 }
+/* the shared ~/.config/sw/config, translated into appwheel's own keys */
+static void config_set_shared(void*ud,const char*k,const char*v){ config_set((Config*)ud,k,v); }
+
+/* `key=value   # what it does` — the trailing comment is not part of the
+ * value. Numbers survived it by accident (atoi stops at the space) but a
+ * string key did not: `sort=recent  # ...` set sort to the whole rest of the
+ * line, which is not "recent", and the most-recently-used order quietly
+ * turned itself off. A '#' only starts a comment after whitespace, so a value
+ * may still contain one. */
+static void strip_comment(char*v){
+    char q=0;
+    for(char*p=v;*p;p++){
+        if(q){ if(*p==q) q=0; continue; }
+        if(*p=='\''||*p=='"'){ q=*p; continue; }
+        if(*p=='#'&&p>v&&isspace((unsigned char)p[-1])){ *p='\0'; return; }
+    }
+}
+
 static void config_load(Config*c,const char*path){
     FILE*f=fopen(path,"r"); if(!f) return;
     char line[8192];
     while(fgets(line,sizeof line,f)){
         char*s=trim(line); if(!*s||*s=='#'||*s==';') continue;
         char*eq=strchr(s,'='); if(!eq) continue;
-        *eq='\0'; config_set(c,trim(s),trim(eq+1));
+        *eq='\0';
+        char*v=eq+1; strip_comment(v);
+        config_set(c,trim(s),trim(v));
     }
     fclose(f);
 }
@@ -669,7 +725,203 @@ static void history_prepend(Config*c,const char*id){
     for(int i=0;i<ln;i++){ fprintf(f,"%s\n",lines[i]); free(lines[i]); }
     fclose(f);
 }
-static void launch(App*a,Config*c){
+/* ------------------------------------------------------------------ */
+/* workspaces — everything sway-shaped is asked of swov, so this file    */
+/* needs no IPC, no JSON and no knowledge of the compositor.             */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int  num;                 /* -1 for a workspace that only has a name */
+    char name[64];            /* "3" or "3:code"                         */
+    int  focused, exists;     /* exists = 0 -> a free number, a new one   */
+} Wsp;
+
+static Wsp  WSP[24];
+static int  NWSP, WSP_TRIED;
+
+static const char *wsp_label(const Wsp*w){
+    const char*colon=strchr(w->name,':');
+    return colon&&colon[1]?colon+1:"";
+}
+
+static int wsp_cmp(const void*A,const void*B){
+    const Wsp*a=A,*b=B;
+    if((a->num<0)!=(b->num<0)) return a->num<0?1:-1;   /* named-only ones last */
+    if(a->num!=b->num) return a->num-b->num;
+    return strcmp(a->name,b->name);
+}
+
+/* `swov --workspaces`, plus the free numbers 1..9 as places to make one */
+static void wsp_load(Config*c){
+    if(WSP_TRIED) return;
+    WSP_TRIED=1; NWSP=0;
+
+    char cmd[PATH_MAX+64];
+    snprintf(cmd,sizeof cmd,"%s --workspaces 2>/dev/null",c->swov);
+    FILE*f=popen(cmd,"r");
+    if(!f) return;
+
+    char line[256];
+    while(NWSP<(int)(sizeof WSP/sizeof*WSP) && fgets(line,sizeof line,f)){
+        char*num=strtok(line,"\t"); if(!num) continue;
+        char*name=strtok(NULL,"\t"); if(!name) continue;
+        strtok(NULL,"\t");                       /* output, not used here */
+        char*flags=strtok(NULL,"\t\n");
+        Wsp*w=&WSP[NWSP++];
+        memset(w,0,sizeof *w);
+        w->num=atoi(num);
+        snprintf(w->name,sizeof w->name,"%s",name);
+        w->exists=1;
+        w->focused=flags&&contains_ci(flags,"focused");
+    }
+    pclose(f);
+    if(NWSP==0) return;                          /* no swov, no dropping   */
+
+    for(int n=1;n<=9 && NWSP<(int)(sizeof WSP/sizeof*WSP);n++){
+        int taken=0;
+        for(int i=0;i<NWSP;i++) if(WSP[i].num==n){ taken=1; break; }
+        if(taken) continue;
+        Wsp*w=&WSP[NWSP++];
+        memset(w,0,sizeof *w);
+        w->num=n; snprintf(w->name,sizeof w->name,"%d",n);
+    }
+    qsort(WSP,NWSP,sizeof*WSP,wsp_cmp);
+}
+
+/* ------------------------------------------------------------------ */
+/* the overview behind the wheel                                        */
+/*                                                                      */
+/* `swov --backdrop` draws the workspaces underneath us and takes no     */
+/* input of its own: we send it the pointer, it sends back the workspace */
+/* under it. Two pipes, one line each way, no shared code.               */
+/* ------------------------------------------------------------------ */
+static int   OV_IN=-1, OV_OUT=-1;     /* our end of its stdin / stdout */
+static pid_t OV_PID=-1;
+static int   OV_READY;                /* its window is up              */
+static char  OV_TARGET[64];           /* the workspace under the cursor */
+static int   OV_HERE;                 /* ...and it is the one we are on  */
+static char  OV_BESIDE[32];           /* con_id of the window under it    */
+static char  OV_EDGE[16];             /* which side of it: left/right/... */
+static int   OV_LOG;                  /* print the conversation to stderr */
+
+static void ov_send(const char*fmt,...){
+    if(OV_IN<0) return;
+    char line[128]; va_list ap; va_start(ap,fmt);
+    int n=vsnprintf(line,sizeof line-1,fmt,ap); va_end(ap);
+    if(n<0) return;
+    line[n]='\n'; line[n+1]='\0';
+    if(OV_LOG) fprintf(stderr,"appwheel: -> %.*s\n",n,line);
+    if(write(OV_IN,line,(size_t)n+1)<0){
+        if(OV_LOG) fprintf(stderr,"appwheel: backdrop pipe closed\n");
+        close(OV_IN); OV_IN=-1;
+    }
+}
+
+static void ov_spawn(Config*c){
+    OV_LOG=c->overview_debug;
+    int to[2], from[2];
+    if(pipe(to)!=0) return;
+    if(pipe(from)!=0){ close(to[0]); close(to[1]); return; }
+
+    signal(SIGPIPE,SIG_IGN);          /* it may be gone before we notice */
+    pid_t p=fork();
+    if(p<0){ close(to[0]);close(to[1]);close(from[0]);close(from[1]); return; }
+    if(p==0){
+        dup2(to[0],0); dup2(from[1],1);
+        close(to[0]); close(to[1]); close(from[0]); close(from[1]);
+        execlp(c->swov,c->swov,c->overview_debug?"--backdrop-debug":"--backdrop",
+               (char*)NULL);
+        fprintf(stderr,"appwheel: cannot run '%s' (%s) — no overview\n",
+                c->swov,strerror(errno));
+        _exit(127);
+    }
+    close(to[0]); close(from[1]);
+    OV_PID=p; OV_IN=to[1]; OV_OUT=from[0];
+    fcntl(OV_OUT,F_SETFL,O_NONBLOCK);
+}
+
+/* whatever it has said since the last frame */
+static void ov_poll(SDL_Window*win){
+    if(OV_OUT<0) return;
+    static char buf[512]; static int len;
+
+    for(;;){
+        ssize_t n=read(OV_OUT,buf+len,sizeof buf-1-(size_t)len);
+        if(n<=0) break;
+        len+=(int)n; buf[len]='\0';
+
+        char*start=buf,*nl;
+        while((nl=strchr(start,'\n'))!=NULL){
+            *nl='\0';
+            if(OV_LOG) fprintf(stderr,"appwheel: <- %s\n",start);
+            if(!strcmp(start,"ready")){
+                OV_READY=1;
+                SDL_RaiseWindow(win);          /* enough on X11 */
+                /* On Wayland a window cannot lift itself, and the backdrop
+                   mapped on top of us. swov is talking to sway anyway. */
+                ov_send("raise " APP_ID);
+            } else if(!strncmp(start,"target ",7)){
+                /* "target 3", "target 3 current", "target 3 beside 42 left" */
+                char buf[160]; snprintf(buf,sizeof buf,"%s",start+7);
+                OV_HERE=0; OV_BESIDE[0]='\0'; OV_EDGE[0]='\0';
+                char*tok=strtok(buf," ");
+                snprintf(OV_TARGET,sizeof OV_TARGET,"%s",
+                         (tok&&strcmp(tok,"none"))?tok:"");
+                while((tok=strtok(NULL," "))!=NULL){
+                    if(!strcmp(tok,"current")) OV_HERE=1;
+                    else if(!strcmp(tok,"beside")){
+                        char*id=strtok(NULL," "), *ed=strtok(NULL," ");
+                        if(id&&ed){ snprintf(OV_BESIDE,sizeof OV_BESIDE,"%s",id);
+                                    snprintf(OV_EDGE,sizeof OV_EDGE,"%s",ed); }
+                    }
+                }
+            }
+            start=nl+1;
+        }
+        len=(int)strlen(start);
+        memmove(buf,start,(size_t)len+1);
+    }
+}
+
+static void ov_stop(void){
+    if(OV_IN>=0){ ov_send("quit"); close(OV_IN); OV_IN=-1; }
+    if(OV_OUT>=0){ close(OV_OUT); OV_OUT=-1; }
+}
+
+/* Hand the launched process to swov, which waits for its window and moves it.
+   sway cannot run something "on workspace N", so this is the way there. */
+static void adopt_to(Config*c,pid_t pid,const char*target,
+                     const char*beside,const char*edge){
+    if(pid<=0||!target||!*target) return;
+    char spid[32];
+    snprintf(spid,sizeof spid,"%d",(int)pid);
+
+    pid_t p=fork();
+    if(p<0) return;
+    if(p==0){
+        int fd=open("/dev/null",O_RDWR);
+        if(fd>=0){ dup2(fd,0); dup2(fd,1); dup2(fd,2); if(fd>2) close(fd); }
+        const char*av[12]; int n=0;
+        av[n++]=c->swov; av[n++]="--adopt"; av[n++]=spid; av[n++]=target;
+        if(beside&&*beside&&edge&&*edge){
+            av[n++]="--beside"; av[n++]=beside; av[n++]="--edge"; av[n++]=edge;
+        }
+        if(c->drop_focus)      av[n++]="--adopt-focus";
+        if(c->overview_debug)  av[n++]="--adopt-debug";
+        av[n]=NULL;
+        execvp(c->swov,(char*const*)av);
+        _exit(127);
+    }
+    waitpid(p,NULL,0);        /* swov backgrounds itself, so this is instant */
+}
+
+static void wsp_adopt(Config*c,pid_t pid,const Wsp*w){
+    char target[80];
+    if(w->num>=0) snprintf(target,sizeof target,"%d",w->num);
+    else          snprintf(target,sizeof target,"%s",w->name);
+    adopt_to(c,pid,target,NULL,NULL);
+}
+
+static pid_t launch(App*a,Config*c){
     char cmd[8192];
     if(!strcmp(c->launcher,"gtk-launch")) snprintf(cmd,sizeof cmd,"gtk-launch %s.desktop",a->id);
     else if(a->terminal) snprintf(cmd,sizeof cmd,"%s -e %s",c->terminal,a->exec);
@@ -682,12 +934,24 @@ static void launch(App*a,Config*c){
        from. We: new session (setsid) so there's no controlling tty, a second
        fork so it can never reacquire one and gets reparented to init, and
        std fds pointed at /dev/null. */
+    /* The grandchild is the one that becomes the app, and its pid is what a
+       drop needs, so it reports itself back through a pipe. */
+    int pfd[2];
+    if(pipe(pfd)!=0){ pfd[0]=pfd[1]=-1; }
+
     pid_t pid=fork();
-    if(pid<0){ fprintf(stderr,"appwheel: fork failed\n"); return; }
+    if(pid<0){ fprintf(stderr,"appwheel: fork failed\n");
+               if(pfd[0]>=0){ close(pfd[0]); close(pfd[1]); } return -1; }
     if(pid==0){
+        if(pfd[0]>=0) close(pfd[0]);
         setsid();
         pid_t p2=fork();
         if(p2>0) _exit(0);
+        if(pfd[1]>=0){
+            pid_t me=getpid();
+            if(write(pfd[1],&me,sizeof me)<0){}
+            close(pfd[1]);
+        }
         int fd=open("/dev/null",O_RDWR);
         if(fd>=0){ dup2(fd,0); dup2(fd,1); dup2(fd,2); if(fd>2) close(fd); }
         const char*home=getenv("HOME"); if(home){ if(chdir(home)!=0){} }
@@ -695,6 +959,14 @@ static void launch(App*a,Config*c){
         _exit(127);
     }
     waitpid(pid,NULL,0);   /* reap the intermediate child; grandchild -> init */
+
+    pid_t app=-1;
+    if(pfd[1]>=0) close(pfd[1]);
+    if(pfd[0]>=0){
+        if(read(pfd[0],&app,sizeof app)!=(ssize_t)sizeof app) app=-1;
+        close(pfd[0]);
+    }
+    return app;
 }
 
 /* ------------------------------------------------------------------ */
@@ -709,6 +981,15 @@ static void fill_circle(SDL_Renderer*r,float cx,float cy,float rad,Col c){
     int idx[SEG*3]; for(int i=0;i<SEG;i++){ idx[i*3]=0; idx[i*3+1]=i+1; idx[i*3+2]=i+2; }
     SDL_RenderGeometry(r,NULL,v,SEG+2,idx,SEG*3);
 }
+/* a thin outline circle: the "let go here" hint around the parked wheel */
+static void ring(SDL_Renderer*r,float cx,float cy,float rad,float thick,Col c){
+    const int SEG=96; SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
+    for(float t=0;t<thick;t+=1.0f)
+        for(int i=0;i<SEG;i++){ float a=(float)(2*M_PI*i/SEG);
+            SDL_FRect d={cx+(rad+t)*cosf(a),cy+(rad+t)*sinf(a),1.5f,1.5f};
+            SDL_RenderFillRect(r,&d); }
+}
+
 static void fill_sector(SDL_Renderer*r,float cx,float cy,float r0,float r1,float a0,float a1,Col c){
     int seg=(int)((a1-a0)/0.04f)+2; if(seg<2)seg=2; if(seg>160)seg=160;
     int nv=(seg+1)*2; SDL_Vertex*v=malloc(nv*sizeof*v); SDL_FColor fc=tofc(c);
@@ -721,6 +1002,21 @@ static void fill_sector(SDL_Renderer*r,float cx,float cy,float r0,float r1,float
         idx[i*6]=b;idx[i*6+1]=b+1;idx[i*6+2]=b+2; idx[i*6+3]=b+1;idx[i*6+4]=b+3;idx[i*6+5]=b+2; }
     SDL_RenderGeometry(r,NULL,v,nv,idx,ni); free(v); free(idx);
 }
+static void fill_round_rect(SDL_Renderer*r,float x,float y,float w,float h,float rad,Col c){
+    if(rad>w/2)rad=w/2; if(rad>h/2)rad=h/2;
+    SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
+    SDL_FRect mid={x,y+rad,w,h-2*rad}, top={x+rad,y,w-2*rad,rad}, bot={x+rad,y+h-rad,w-2*rad,rad};
+    SDL_RenderFillRect(r,&mid); SDL_RenderFillRect(r,&top); SDL_RenderFillRect(r,&bot);
+    fill_circle(r,x+rad,y+rad,rad,c);       fill_circle(r,x+w-rad,y+rad,rad,c);
+    fill_circle(r,x+rad,y+h-rad,rad,c);     fill_circle(r,x+w-rad,y+h-rad,rad,c);
+}
+
+static void stroke_rect(SDL_Renderer*r,float x,float y,float w,float h,float t,Col c){
+    SDL_SetRenderDrawColor(r,c.r,c.g,c.b,c.a);
+    SDL_FRect e[4]={{x,y,w,t},{x,y+h-t,w,t},{x,y,t,h},{x+w-t,y,t,h}};
+    for(int i=0;i<4;i++) SDL_RenderFillRect(r,&e[i]);
+}
+
 static void fill_tri(SDL_Renderer*r,float x0,float y0,float x1,float y1,float x2,float y2,Col c){
     SDL_FColor fc=tofc(c);
     SDL_Vertex v[3]={ {{x0,y0},fc,{0,0}}, {{x1,y1},fc,{0,0}}, {{x2,y2},fc,{0,0}} };
@@ -794,6 +1090,21 @@ static void dump_config(void){
 "# font=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\n"
 "font_px=50        # glyph atlas height; the sharpness ceiling for big text\n"
 "\n"
+"# --- dropping an app onto a workspace ---\n"
+"# Drag an app out of the wheel and let go over a workspace: it starts there,\n"
+"# and the wheel stays open. Needs swov on PATH, which is asked for the\n"
+"# workspace list and does the moving.\n"
+"drop=1           # 0 = off, the wheel then only launches\n"
+"drop_shrink=0.55 # how small the wheel goes while you drag\n"
+"drop_corner=top-left  # top-left, top-right or none. Letting go over the\n"
+"                 # wheel there cancels instead of opening anything\n"
+"drop_ms=130      # how long that takes\n"
+"drop_px=10       # movement before a press turns into a drag\n"
+"drop_focus=0     # 1 = also switch to that workspace\n"
+"drop_close_here=0  # dropping on the workspace you are on keeps the wheel\n"
+"                 # open too; 1 = close, so the new window is not behind it\n"
+"# swov=swov      # the binary to ask (a path works too)\n"
+"\n"
 "# --- launching / ordering ---\n"
 "# appwheel logs every app you launch to the history file below and shows the\n"
 "# most-recently-opened ones first. This is the default (sort=recent).\n"
@@ -824,7 +1135,7 @@ static void dump_config(void){
 
 static void usage(const char*a0){
     printf(
-"appwheel — a GTA-V-style radial (weapon-wheel) app launcher (Wayland & X11)\n"
+"appwheel " APPWHEEL_VERSION " (build " APPWHEEL_BUILD ") — a radial app launcher\n"
 "\n"
 "USAGE\n"
 "  %s [options] [key=value ...]\n"
@@ -843,6 +1154,7 @@ static void usage(const char*a0){
 "  -d, --dmenu         read newline-separated items from stdin, print the chosen\n"
 "                      one to stdout (a dmenu/bemenu/wofi-style picker)\n"
 "  -h, --help          show this help and exit\n"
+"  -v, --version       print the version and build id, and exit\n"
 "\n"
 "LAYOUT / INTERACTION\n"
 "  slots=11            wide, easy-to-hit app slots across the top arc\n"
@@ -865,6 +1177,18 @@ static void usage(const char*a0){
 "  font=PATH|FAMILY    a .ttf path, or a fontconfig family like \"JetBrains Mono\".\n"
 "                      Default: your desktop's configured font (via fc-match).\n"
 "  font_px=50          atlas raster height; larger = crisper big text\n"
+"\n"
+"DROP ONTO A WORKSPACE\n"
+"  Drag an app out of the wheel and drop it on a workspace: it starts there\n"
+"  and the wheel stays open. Dropping it back on the wheel does nothing.\n"
+"  Needs swov on PATH — it supplies the workspace list and moves the window.\n"
+"  drop=1              0 = off\n"
+"  drop_shrink=0.55    how small the wheel goes while dragging\n"
+"  drop_corner=top-left  where it parks while dragging: top-left, top-right\n"
+"                      or none. Letting go over the wheel there cancels\n"
+"  drop_ms=130 drop_px=10\n"
+"  drop_focus=0        1 = also switch to that workspace\n"
+"  swov=swov           the binary to ask\n"
 "\n"
 "RENDERING\n"
 "  ssaa=2              full-scene supersampling 1..4 (smooths edges; alias: aa)\n"
@@ -942,15 +1266,18 @@ int main(int argc,char**argv){
         if((!strcmp(argv[i],"-c")||!strcmp(argv[i],"--config"))&&i+1<argc)
             snprintf(cfgpath,sizeof cfgpath,"%s",argv[++i]);
         else if(!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")){ usage(argv[0]); return 0; }
+        else if(!strcmp(argv[i],"-v")||!strcmp(argv[i],"--version")){
+            printf("appwheel %s (build %s)\n",APPWHEEL_VERSION,APPWHEEL_BUILD); return 0; }
         else if(!strcmp(argv[i],"--dump-config")){ dump_config(); return 0; }
         else if(!strcmp(argv[i],"--list")) want_list=1;
         else if(!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")) dmenu=1;
     }
     { char tmp[PATH_MAX]; expand_tilde(cfgpath,tmp,sizeof tmp); snprintf(cfgpath,sizeof cfgpath,"%s",tmp); }
-    config_load(&cfg,cfgpath);
+    sw_shared_apply("appwheel",config_set_shared,&cfg);   /* shared first */
+    config_load(&cfg,cfgpath);                            /* our own wins  */
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"-c")||!strcmp(argv[i],"--config")){ i++; continue; }
-        if(!strcmp(argv[i],"--list")||!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")||!strcmp(argv[i],"--dump-config")||!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")) continue;
+        if(!strcmp(argv[i],"--list")||!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")||!strcmp(argv[i],"--dump-config")||!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")||!strcmp(argv[i],"-v")||!strcmp(argv[i],"--version")) continue;
         if(!strcmp(argv[i],"--no-recent")||!strcmp(argv[i],"--all-apps")){ cfg.recent_first=0; continue; }
         char*a=argv[i]; while(*a=='-') a++;            /* accept --key=value too */
         char*eq=strchr(a,'='); if(eq){ *eq='\0'; config_set(&cfg,a,eq+1); }
@@ -971,10 +1298,10 @@ int main(int argc,char**argv){
         return 0;
     }
 
-    /* Identify as AppWheel so the compositor shows a proper name, and set the
+    /* Identify as appwheel so the compositor shows the same name everywhere,
        Wayland app_id / X11 WM_CLASS so float/center rules match. Before init. */
-    SDL_SetAppMetadata("AppWheel","1.0","org.appwheel.AppWheel");
-    SDL_SetHint(SDL_HINT_APP_ID,"appwheel");
+    SDL_SetAppMetadata(APP_ID,APPWHEEL_VERSION,"org.appwheel.appwheel");
+    SDL_SetHint(SDL_HINT_APP_ID,APP_ID);
 
     if(!SDL_Init(SDL_INIT_VIDEO)){ fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1; }
 
@@ -990,7 +1317,7 @@ int main(int argc,char**argv){
     }
     SDL_WindowFlags wf=SDL_WINDOW_BORDERLESS|SDL_WINDOW_ALWAYS_ON_TOP;
     if(cfg.bg.a<255) wf|=SDL_WINDOW_TRANSPARENT;
-    SDL_Window*win=SDL_CreateWindow("AppWheel",winw,winh,wf);
+    SDL_Window*win=SDL_CreateWindow(APP_ID,winw,winh,wf);
     if(!win){ fprintf(stderr,"CreateWindow: %s\n",SDL_GetError()); return 1; }
     if(have_bounds) SDL_SetWindowPosition(win,dbounds.x,dbounds.y);
     SDL_Renderer*ren=SDL_CreateRenderer(win,NULL);
@@ -1039,10 +1366,26 @@ int main(int argc,char**argv){
         fn=build_filter(&apps,query,filt,cfg.slots,cfg.recent_first,&off,&selslot); anim0=SDL_GetTicks(); }while(0)
     REBUILD();
 
+    /* --- drag an app out of the wheel and onto a workspace ---
+       A press only arms it. If the pointer stays put the release launches, as
+       it always did; if it moves, the wheel shrinks out of the way and the
+       workspaces appear along the top. Dropping keeps the wheel open. */
+    int   dragging=0, press_down=0, press_item=-1, drop_ws=-1;
+    float press_x=0, press_y=0;
+    float wheel_scale=1.0f;               /* animated 1 -> drop_shrink */
+    float corner_t=0.0f;                  /* 0 = centred, 1 = parked in a corner */
+    Uint64 flash_at=0; int flash_ws=-1;   /* the tile that just took an app */
+    SDL_FRect wsp_rect[24];
+
     int page_dir=0; float page_speed=0;   /* for the paging indicators         */
     float mx=cfg.width/2.0f,my=cfg.height/2.0f;
     Uint64 last_page=0, blink0=SDL_GetTicks();
     int running=1, had_focus=0, page_armed=0, prev_region=0, chose=0;
+    int ov_started=0; float ov_lx=-1, ov_ly=-1;
+    /* SDL reports where the pointer already is as soon as the window is up.
+       That is not the user moving it, and it must not throw away the
+       selection we opened with. */
+    int mouse_live=0; float m0x=0, m0y=0; int mouse_seen=0;
     #define CHOOSE() do{ if(dmenu){ printf("%s\n",apps.v[filt[sel]].name); fflush(stdout); chose=1; } \
                          else launch(&apps.v[filt[sel]],&cfg); running=0; }while(0)
     float arc=cfg.arc_deg*(float)DEG; if(arc<60*DEG)arc=60*DEG; if(arc>330*DEG)arc=330*DEG;
@@ -1053,9 +1396,53 @@ int main(int argc,char**argv){
     while(running){
         int w,h; SDL_GetWindowSize(win,&w,&h);
         int ss=cfg.ssaa;
-        float mind=(w<h?w:h);
-        float cx=w/2.0f, cy=h/2.0f + cfg.y_offset*mind;
+
+        {   /* ease the wheel down to drop_shrink and into its corner, and back */
+            float want = dragging ? cfg.drop_shrink : 1.0f;
+            float step = cfg.drop_ms>0 ? 16.0f/(float)cfg.drop_ms : 1.0f;
+            if(wheel_scale<want){ wheel_scale+=step; if(wheel_scale>want)wheel_scale=want; }
+            else if(wheel_scale>want){ wheel_scale-=step; if(wheel_scale<want)wheel_scale=want; }
+
+            float cwant = dragging ? 1.0f : 0.0f;
+            if(corner_t<cwant){ corner_t+=step; if(corner_t>cwant)corner_t=cwant; }
+            else if(corner_t>cwant){ corner_t-=step; if(corner_t<cwant)corner_t=cwant; }
+        }
+
+        float mind=(w<h?w:h)*wheel_scale;
         float R=mind*cfg.radius, ri=R*0.46f, rc=ri*0.95f, rl=(R+ri)/2.0f;
+        float cx=w/2.0f, cy=h/2.0f + cfg.y_offset*mind;
+
+        /* Out of the way: parked in a corner the wheel stops covering the
+           workspaces you are aiming at, and becomes the place to drop an app
+           you have changed your mind about. */
+        int corner_left = !strcmp(cfg.drop_corner,"top-left");
+        int corner_on   = corner_left || !strcmp(cfg.drop_corner,"top-right");
+        if(corner_on && corner_t>0.0f){
+            float pad=R*0.12f+14.0f*cfg.ui_scale;
+            float tx=corner_left ? R+pad : (float)w-R-pad;
+            float ty=R+pad;
+            float e=corner_t*corner_t*(3.0f-2.0f*corner_t);   /* smoothstep */
+            cx += (tx-cx)*e;
+            cy += (ty-cy)*e;
+        }
+        int over_wheel = dragging &&
+            ((mx-cx)*(mx-cx)+(my-cy)*(my-cy)) < (R*1.12f)*(R*1.12f);
+
+        /* the workspace strip across the top, laid out every frame so it
+           follows a resize */
+        float tile_h=0, tile_y=0;
+        if(NWSP>0){
+            float margin=w*0.035f, gap=w*0.007f;
+            float avail=(float)w-2*margin-(float)(NWSP-1)*gap;
+            float tw=avail/(float)NWSP;
+            float maxw=230.0f*cfg.ui_scale;
+            if(tw>maxw){ tw=maxw;
+                margin=((float)w-(tw*(float)NWSP+(float)(NWSP-1)*gap))/2.0f; }
+            tile_h=(float)h*0.135f; if(tile_h>190.0f*cfg.ui_scale) tile_h=190.0f*cfg.ui_scale;
+            tile_y=(float)h*0.035f;
+            for(int i=0;i<NWSP;i++)
+                wsp_rect[i]=(SDL_FRect){ margin+(tw+gap)*(float)i, tile_y, tw, tile_h };
+        }
 
         int searching = query[0]!=0;
         int vis = fn? (fn<cfg.slots?fn:cfg.slots) : 0;
@@ -1076,7 +1463,7 @@ int main(int argc,char**argv){
            fires from wherever the cursor happened to open on (startup safety). --- */
         float half_arc = arc/2 + 2.0f*(float)DEG;     /* apps fill the arc; page below it */
         page_dir=0; page_speed=0;
-        if(page_armed){
+        if(page_armed && !dragging){
           float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
           if(dist>rc){
               float pa=atan2f(dy,dx), dtop=norm_ang(pa-top);
@@ -1099,13 +1486,58 @@ int main(int argc,char**argv){
           }
         }
 
+        if(OV_OUT>=0) ov_poll(win);
+
         SDL_Event ev;
         while(SDL_PollEvent(&ev)){
             if(ev.type==SDL_EVENT_QUIT) running=0;
             else if(ev.type==SDL_EVENT_WINDOW_FOCUS_GAINED) had_focus=1;
-            else if(ev.type==SDL_EVENT_WINDOW_FOCUS_LOST){ if(cfg.close_on_focus_loss && had_focus) running=0; }
+            else if(ev.type==SDL_EVENT_WINDOW_FOCUS_LOST){
+                /* With the overview up, apps are being started behind us on
+                   purpose; each one takes the focus for a moment and that is
+                   not a reason to close. */
+                if(cfg.close_on_focus_loss && had_focus && !OV_READY) running=0;
+            }
             else if(ev.type==SDL_EVENT_MOUSE_MOTION){
                 mx=ev.motion.x; my=ev.motion.y;
+
+                if(!mouse_live){
+                    if(!mouse_seen){ mouse_seen=1; m0x=mx; m0y=my; }
+                    else if(fabsf(mx-m0x)>2.0f||fabsf(my-m0y)>2.0f) mouse_live=1;
+                    if(!mouse_live) continue;   /* the pointer has not moved yet */
+                }
+
+                if(press_down && !dragging && cfg.drop && press_item>=0){
+                    float dx=mx-press_x, dy=my-press_y;
+                    if(dx*dx+dy*dy > (float)(cfg.drop_px*cfg.drop_px)){
+                        if(OV_READY){ dragging=1; ov_send("drag on"); }
+                        else {
+                            wsp_load(&cfg);      /* first drag pays for the list */
+                            if(NWSP>0) dragging=1; else press_item=-1;
+                        }
+                    }
+                }
+                if(dragging){
+                    /* Over the wheel means "never mind": the overview is told
+                       there is no target, so a workspace underneath the wheel
+                       is not picked up by accident. */
+                    if(OV_READY){
+                        if(mx!=ov_lx||my!=ov_ly){         /* ask the overview */
+                            ov_lx=mx; ov_ly=my;
+                            if(over_wheel){ ov_send("hover -1 -1"); OV_TARGET[0]='\0'; }
+                            else ov_send("hover %.4f %.4f",mx/(float)w,my/(float)h);
+                        }
+                    } else {
+                        drop_ws=-1;
+                        if(!over_wheel)
+                            for(int i=0;i<NWSP;i++){
+                                SDL_FRect t=wsp_rect[i];
+                                if(mx>=t.x&&mx<t.x+t.w&&my>=t.y&&my<t.y+t.h){ drop_ws=i; break; }
+                            }
+                    }
+                    continue;                    /* no slot hover while dragging */
+                }
+
                 float dx=mx-cx,dy=my-cy,dist=sqrtf(dx*dx+dy*dy);
                 int region=1; float adtop=0;   /* 1=apps/center, 2=bottom off-icon, 3=on icon */
                 if(dist>rc){
@@ -1142,8 +1574,53 @@ int main(int argc,char**argv){
                 }
             }
             else if(ev.type==SDL_EVENT_MOUSE_BUTTON_DOWN){
-                if(ev.button.button==SDL_BUTTON_LEFT&&fn){ CHOOSE(); }
-                else if(ev.button.button==SDL_BUTTON_RIGHT) running=0;
+                if(ev.button.button==SDL_BUTTON_LEFT&&fn){
+                    press_down=1; press_x=ev.button.x; press_y=ev.button.y;
+                    /* the bottom zone is for paging; nothing is dragged there */
+                    press_item=(prev_region==2||prev_region==3)?-1:filt[sel];
+                }
+                else if(ev.button.button==SDL_BUTTON_RIGHT){
+                    if(dragging){ dragging=press_down=0; drop_ws=-1; press_item=-1;
+                                  if(OV_READY){ ov_send("drag off"); OV_TARGET[0]='\0'; } }
+                    else running=0;
+                }
+            }
+            else if(ev.type==SDL_EVENT_MOUSE_BUTTON_UP){
+                if(ev.button.button==SDL_BUTTON_LEFT){
+                    if(dragging){
+                        if(OV_READY){
+                            if(over_wheel) OV_TARGET[0]='\0';   /* changed my mind */
+                            if(OV_TARGET[0] && press_item>=0){
+                                pid_t p=launch(&apps.v[press_item],&cfg);
+                                /* Straight down the pipe we already have, so
+                                   sway knows where the window belongs before
+                                   the app has finished starting: it never
+                                   lands here first and nothing on this
+                                   workspace gets rearranged. */
+                                if(p>0) ov_send("assign %d %s",(int)p,OV_TARGET);
+                                adopt_to(&cfg,p,OV_TARGET,OV_BESIDE,OV_EDGE);
+                                /* the new window takes the focus as it opens;
+                                   the wheel is meant to stay in front of it */
+                                if(OV_HERE && cfg.drop_close_here) running=0;
+                                else ov_send("raise " APP_ID);
+                            }
+                            ov_send("drag off");
+                            OV_TARGET[0]='\0'; OV_HERE=0;
+                            OV_BESIDE[0]='\0'; OV_EDGE[0]='\0'; ov_lx=ov_ly=-1;
+                        } else if(!over_wheel && drop_ws>=0 && press_item>=0){
+                            pid_t p=launch(&apps.v[press_item],&cfg);
+                            wsp_adopt(&cfg,p,&WSP[drop_ws]);
+                            WSP[drop_ws].exists=1;      /* it will be there now */
+                            flash_ws=drop_ws; flash_at=SDL_GetTicks();
+                            if(WSP[drop_ws].focused && cfg.drop_close_here) running=0;
+                        }
+                        /* dropped on the wheel, or nowhere: nothing happens */
+                        dragging=0; drop_ws=-1;
+                    } else if(press_down && fn){
+                        CHOOSE();
+                    }
+                    press_down=0; press_item=-1;
+                }
             }
             else if(ev.type==SDL_EVENT_TEXT_INPUT){
                 strncat(query,ev.text.text,sizeof query-strlen(query)-1);
@@ -1151,7 +1628,12 @@ int main(int argc,char**argv){
             }
             else if(ev.type==SDL_EVENT_KEY_DOWN){
                 SDL_Keycode k=ev.key.key;
-                if(k==SDLK_ESCAPE){ if(query[0]){query[0]='\0';REBUILD();} else running=0; }
+                if(k==SDLK_ESCAPE){
+                    if(dragging){ dragging=press_down=0; drop_ws=-1; press_item=-1;
+                                  if(OV_READY){ ov_send("drag off"); OV_TARGET[0]='\0'; } }
+                    else if(query[0]){ query[0]='\0'; REBUILD(); }
+                    else running=0;
+                }
                 else if(k==SDLK_RETURN||k==SDLK_KP_ENTER){ if(fn){ CHOOSE(); } }
                 else if(k==SDLK_BACKSPACE){ int L=strlen(query);
                     if(L>0){ L--; while(L>0&&((unsigned char)query[L]&0xC0)==0x80)L--; query[L]='\0'; REBUILD(); } }
@@ -1278,6 +1760,46 @@ int main(int argc,char**argv){
             text_centered(ren,&font,cx,cy,cfg.title_px*ui,cfg.dim,"no matches");
         }
 
+        /* --- the workspaces, and the app hanging off the pointer --- */
+        if(!OV_READY && (dragging || (flash_ws>=0 && SDL_GetTicks()-flash_at<420))){
+            float rad=10.0f*ui;
+            for(int i=0;i<NWSP;i++){
+                SDL_FRect t=wsp_rect[i];
+                int hot=(i==drop_ws), lit=(i==flash_ws && SDL_GetTicks()-flash_at<420);
+                Col fill=hot||lit?cfg.hl:(WSP[i].exists?cfg.ring:cfg.bg);
+                if(!WSP[i].exists && !hot && !lit) fill.a=0;
+
+                if(fill.a) fill_round_rect(ren,t.x,t.y,t.w,t.h,rad,fill);
+                if(!WSP[i].exists && !hot && !lit)
+                    stroke_rect(ren,t.x,t.y,t.w,t.h,SDL_max(1.0f,1.5f*ui),cfg.dim);
+                else if(WSP[i].focused && !hot && !lit)
+                    stroke_rect(ren,t.x,t.y,t.w,t.h,SDL_max(1.0f,2.0f*ui),cfg.accent);
+
+                Col tc = hot||lit ? cfg.hltext : (WSP[i].exists?cfg.text:cfg.dim);
+                char num[16]; snprintf(num,sizeof num,"%d",WSP[i].num);
+                const char*lbl=wsp_label(&WSP[i]);
+                float ny = *lbl ? t.y+t.h*0.40f : t.y+t.h*0.5f;
+                text_centered(ren,&font,t.x+t.w/2,ny,cfg.title_px*ui*1.15f,tc,num);
+                if(*lbl){
+                    char cut[80]; fit_label(&font,cfg.count_px*ui,lbl,t.w*0.86f,cut,sizeof cut);
+                    text_centered(ren,&font,t.x+t.w/2,t.y+t.h*0.72f,cfg.count_px*ui,tc,cut);
+                }
+            }
+        }
+        if(over_wheel){                      /* the wheel says: let go here to stop */
+            Col o=cfg.dim; o.a=200;
+            ring(ren,cx,cy,R*1.12f,SDL_max(2.0f,2.0f*ui),o);
+        }
+        if(dragging && press_item>=0){
+            App*a=&apps.v[press_item];
+            float isz=cfg.icon_px*ui*1.15f;
+            SDL_Texture*ic=app_icon(ren,a,&cfg);
+            if(ic){ SDL_FRect d={mx-isz/2,my-isz/2,isz,isz};
+                    SDL_SetTextureAlphaMod(ic,235); SDL_RenderTexture(ren,ic,NULL,&d); }
+            char cut[160]; fit_label(&font,cfg.label_px*ui,a->name,300.0f*ui,cut,sizeof cut);
+            text_centered(ren,&font,mx,my+isz*0.72f,cfg.label_px*ui,cfg.text,cut);
+        }
+
         if(ss>1 && target){
             SDL_SetRenderScale(ren,1,1);
             SDL_SetRenderTarget(ren,NULL);
@@ -1286,8 +1808,14 @@ int main(int argc,char**argv){
             SDL_RenderTexture(ren,target,NULL,NULL);     /* fade is per-element now */
         }
         SDL_RenderPresent(ren);
+
+        if(!ov_started && cfg.overview && cfg.drop){
+            ov_started=1;             /* only now: the wheel is already up */
+            ov_spawn(&cfg);
+        }
         SDL_Delay(16);
     }
+    ov_stop();
 
     if(target)SDL_DestroyTexture(target);
     SDL_StopTextInput(win);

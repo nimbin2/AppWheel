@@ -23,6 +23,7 @@ CFLAGS      ?= -O2
 PREFIX      ?= $(HOME)/.local
 bindir      ?= $(PREFIX)/bin
 
+BUILD       := $(shell md5sum appwheel.c 2>/dev/null | cut -c1-8)
 SRC         := appwheel.c
 BIN         := appwheel
 
@@ -36,19 +37,21 @@ SDL_STATIC_EXTRA := $(filter-out -lSDL3,$(shell $(PKG_CONFIG) --static --libs sd
 
 all: $(BIN)
 
-$(BIN): $(SRC) stb_truetype.h stb_image.h
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+$(BIN): $(SRC) stb_truetype.h stb_image.h sw_theme.h
+	$(CC) $(CFLAGS) -DAPPWHEEL_BUILD='"$(BUILD)"' $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+	@./$(BIN) --version
 
 # Link libSDL3.a statically while keeping system libs dynamic.
-static: $(SRC) stb_truetype.h stb_image.h
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(SRC) -o $(BIN) \
+static: $(SRC) stb_truetype.h stb_image.h sw_theme.h
+	$(CC) $(CFLAGS) -DAPPWHEEL_BUILD='"$(BUILD)"' $(SDL_CFLAGS) $(SRC) -o $(BIN) \
 	  $(SDL_LDPATH) -Wl,-Bstatic -lSDL3 -Wl,-Bdynamic $(SDL_STATIC_EXTRA) -lm
 	@echo "built ./$(BIN) with SDL baked in:"; \
 	 ldd $(BIN) | grep -qi SDL3 && echo "  (warning: still links libSDL3.so)" \
 	   || echo "  no libSDL3.so dependency."
 
-strict: $(SRC) stb_truetype.h stb_image.h
-	$(CC) -O2 -Wall -Wextra -Wno-misleading-indentation $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+strict: $(SRC) stb_truetype.h stb_image.h sw_theme.h
+	$(CC) -O2 -Wall -Wextra -Wno-misleading-indentation -DAPPWHEEL_BUILD='"$(BUILD)"' \
+	  $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
 
 run: all
 	./$(BIN)
@@ -56,6 +59,7 @@ run: all
 install: all
 	install -Dm755 $(BIN) $(DESTDIR)$(bindir)/$(BIN)
 	@echo "installed to $(DESTDIR)$(bindir)/$(BIN)"
+	@./$(BIN) --version
 
 config: all
 	@mkdir -p $(HOME)/.config/appwheel
