@@ -1,7 +1,7 @@
-# appwheel config  —  ~/.config/appwheel/config
+# swas config  —  ~/.config/swas/config
 # One key=value per line. '#' starts a comment. Blank lines are ignored.
 # Every key here also works on the command line (key=value or --key=value);
-# command-line values win over the file. See `appwheel --help` for the full list.
+# command-line values win over the file. See `swas --help` for the full list.
 # The values below are the built-in defaults, so this file changes nothing
 # until you edit it.
 
@@ -34,7 +34,7 @@ label_px=24       # app labels on the wheel   (all four are multiplied by
 title_px=25       # selected app name (center)  ui_scale, so tweak one or all)
 search_px=20      # the text you type (search box)
 count_px=20       # the "3 / 42" counter
-# By default appwheel uses your desktop's configured font (via fontconfig).
+# By default swas uses your desktop's configured font (via fontconfig).
 # Set a .ttf path or a family name to override, e.g. font=JetBrains Mono
 # font=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 font_px=50        # glyph atlas height; the sharpness ceiling for big text
@@ -45,10 +45,14 @@ font_px=50        # glyph atlas height; the sharpness ceiling for big text
 # list and moves the window once it appears.
 drop=1            # 0 = off, the wheel then only launches
 drop_shrink=0.55  # how small the wheel goes while you drag
-drop_corner=top-left   # where it parks while you drag: top-left, top-right
-                  # or none to keep it in the middle. Letting go over the
-                  # wheel there cancels, so it never fights the workspace
-                  # underneath it
+drop_size=132     # how wide the wheel is while you drag, in pixels. It is
+                  # scaled, not redrawn, so it looks the same, just small.
+                  # 0 = use drop_shrink as a fraction of the screen instead
+drop_bg=0d1117d9  # a disc behind the wheel while it is small, so it does not
+                  # get lost over the overview. Alpha 00 for none
+drop_corner=center  # where it sits while dragging: center, top-left,
+                  # top-right, bottom-left, bottom-right. Letting go over the
+                  # wheel cancels wherever it is
 drop_ms=130       # how long that takes
 drop_px=10        # movement before a press turns into a drag
 drop_focus=0      # 1 = also switch to that workspace
@@ -64,15 +68,15 @@ overview_debug=0  # 1 = print the conversation with the backdrop to stderr
 # swov=swov       # the binary to ask (a path works too)
 
 # --- launching / ordering ---
-# appwheel logs every app you launch to the history file below and shows the
+# swas logs every app you launch to the history file below and shows the
 # most-recently-opened ones first. This is the default (sort=recent).
 sort=recent       # recent = most-recently-opened first (DEFAULT) | alpha = A-Z
 launcher=sh       # sh = run Exec= ; gtk-launch = launch by desktop id
 terminal=xterm    # used for Terminal=true entries when launcher=sh
-# history=~/.cache/appwheel/history   # the opened-apps log (auto-created)
+# history=~/.cache/swas/history   # the opened-apps log (auto-created)
 
 # which apps show / in what order (an id is the .desktop filename without
-# the extension; run `appwheel --list` to see them):
+# the extension; run `swas --list` to see them):
 # dirs=~/.local/share/applications:/usr/share/applications
 # include=firefox,code,gimp     # show ONLY these ids, in this exact order
 # exclude=htop,xterm            # hide these (matches id OR Name)

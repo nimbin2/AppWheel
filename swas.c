@@ -1,5 +1,5 @@
 /*
- * appwheel — a GTA-V-style radial (weapon-wheel) app launcher for Wayland & X11.
+ * swas — Sway App Selector: a radial (weapon-wheel) app launcher, Wayland & X11.
  *
  * Dependencies:
  *   - SDL3            (the only library you link)
@@ -9,7 +9,7 @@
  * The vendored *.h files just sit next to this source; nothing to install/link.
  *
  * Build:
- *   cc appwheel.c -o appwheel $(pkg-config --cflags --libs sdl3) -lm
+ *   cc swas.c -o swas $(pkg-config --cflags --libs sdl3) -lm
  *
  * See --help for every option (all config keys also work on the command line).
  */
@@ -39,11 +39,11 @@
 
 #include "sw_theme.h"
 
-#define APP_ID "appwheel"          /* wayland app_id / X11 WM_CLASS */
+#define APP_ID "swas"          /* wayland app_id / X11 WM_CLASS */
 
-#define APPWHEEL_VERSION "1.1"
-#ifndef APPWHEEL_BUILD             /* set by the Makefile: md5 of this file */
-#define APPWHEEL_BUILD "unknown"
+#define SWAS_VERSION "1.2"
+#ifndef SWAS_BUILD             /* set by the Makefile: md5 of this file */
+#define SWAS_BUILD "unknown"
 #endif
 
 /* SVG icons via nanosvg (vendored single-header). Third-party headers, so we
@@ -142,11 +142,29 @@ typedef struct {
     int   drop_ms, drop_px, drop_focus;
     int   drop_close_here;            /* dropped on the workspace we are on:
                                          close, or the app opens behind us   */
-    char  drop_corner[16];            /* where the wheel goes while dragging:
-                                         top-left, top-right, or none        */
+    char  drop_corner[16];            /* where the wheel sits while dragging:
+                                         center, top-left, top-right,
+                                         bottom-left, bottom-right, none     */
+    int   drop_size;                  /* its width in px then; 0 = use
+                                         drop_shrink as a fraction instead   */
     char  swov[PATH_MAX];             /* the binary that knows about sway */
     Col bg,ring,ring2,hl,text,hltext,center,accent,dim;
+    Col drop_bg;                      /* the disc behind the shrunken wheel */
 } Config;
+
+/* ~/.config/swas/..., falling back to the old ~/.config/appwheel/... so an
+   existing config and history keep working after the rename */
+static void xdg_path(char*out,size_t n,const char*envvar,const char*dotdir,
+                     const char*leaf){
+    const char*base=getenv(envvar); const char*home=getenv("HOME");
+    char legacy[PATH_MAX];
+    if(base&&*base){ snprintf(out,n,"%s/swas/%s",base,leaf);
+                     snprintf(legacy,sizeof legacy,"%s/appwheel/%s",base,leaf); }
+    else if(home){   snprintf(out,n,"%s/%s/swas/%s",home,dotdir,leaf);
+                     snprintf(legacy,sizeof legacy,"%s/%s/appwheel/%s",home,dotdir,leaf); }
+    else { out[0]='\0'; return; }
+    if(access(out,F_OK)!=0&&access(legacy,F_OK)==0) snprintf(out,n,"%s",legacy);
+}
 
 static void config_defaults(Config*c){
     memset(c,0,sizeof *c);
@@ -159,14 +177,13 @@ static void config_defaults(Config*c){
     c->animate=1; c->anim_ms=90; c->recent_first=1;
     c->drop=1; c->drop_shrink=0.55f; c->drop_ms=130; c->drop_px=10; c->drop_focus=0;
     c->overview=0; c->overview_debug=0; c->drop_close_here=0;
-    strcpy(c->drop_corner,"top-left");
+    strcpy(c->drop_corner,"center"); c->drop_size=66;
     strcpy(c->swov,"swov");
     strcpy(c->sort,"recent"); strcpy(c->launcher,"sh");
     const char*term=getenv("TERMINAL");
     snprintf(c->terminal,sizeof c->terminal,"%s",term?term:"xterm");
-    const char*home=getenv("HOME"),*xc=getenv("XDG_CACHE_HOME");
-    if(xc&&*xc) snprintf(c->history,sizeof c->history,"%s/appwheel/history",xc);
-    else        snprintf(c->history,sizeof c->history,"%s/.cache/appwheel/history",home?home:".");
+
+    xdg_path(c->history,sizeof c->history,"XDG_CACHE_HOME",".cache","history");
     c->bg    =(Col){0x0d,0x11,0x17,0x00};   /* transparent by default */
     c->ring  =(Col){0x1e,0x27,0x33,0xf2};
     c->ring2 =(Col){0x26,0x31,0x3f,0xf2};
@@ -174,6 +191,7 @@ static void config_defaults(Config*c){
     c->text  =(Col){0xe8,0xe8,0xe8,0xff};
     c->hltext=(Col){0x14,0x14,0x14,0xff};
     c->center=(Col){0x0d,0x11,0x17,0xe6};
+    c->drop_bg=(Col){0x0d,0x11,0x17,0xd9};
     c->accent=(Col){0x89,0xaf,0xc4,0xff};
     c->dim   =(Col){0x5a,0x6b,0x7a,0xff};
 }
@@ -203,7 +221,9 @@ static void config_set(Config*c,const char*k,const char*v){
     else if(!strcmp(k,"overview"))c->overview=atoi(v);
     else if(!strcmp(k,"overview_debug"))c->overview_debug=atoi(v);
     else if(!strcmp(k,"drop_close_here"))c->drop_close_here=atoi(v);
-    else if(!strcmp(k,"drop_corner"))snprintf(c->drop_corner,sizeof c->drop_corner,"%s",v);
+    else if(!strcmp(k,"drop_corner")||!strcmp(k,"drop_pos"))
+        snprintf(c->drop_corner,sizeof c->drop_corner,"%s",v);
+    else if(!strcmp(k,"drop_size"))c->drop_size=atoi(v);
     else if(!strcmp(k,"drop_shrink"))c->drop_shrink=(float)atof(v);
     else if(!strcmp(k,"drop_ms"))c->drop_ms=atoi(v);
     else if(!strcmp(k,"drop_px"))c->drop_px=atoi(v);
@@ -224,11 +244,12 @@ static void config_set(Config*c,const char*k,const char*v){
     else if(!strcmp(k,"text"))parse_color(v,&c->text);
     else if(!strcmp(k,"hltext"))parse_color(v,&c->hltext);
     else if(!strcmp(k,"center"))parse_color(v,&c->center);
+    else if(!strcmp(k,"drop_bg"))parse_color(v,&c->drop_bg);
     else if(!strcmp(k,"accent"))parse_color(v,&c->accent);
     else if(!strcmp(k,"dim"))parse_color(v,&c->dim);
     else fprintf(stderr,"wheel: unknown key '%s'\n",k);
 }
-/* the shared ~/.config/sw/config, translated into appwheel's own keys */
+/* the shared ~/.config/sw/config, translated into swas's own keys */
 static void config_set_shared(void*ud,const char*k,const char*v){ config_set((Config*)ud,k,v); }
 
 /* `key=value   # what it does` — the trailing comment is not part of the
@@ -809,9 +830,9 @@ static void ov_send(const char*fmt,...){
     int n=vsnprintf(line,sizeof line-1,fmt,ap); va_end(ap);
     if(n<0) return;
     line[n]='\n'; line[n+1]='\0';
-    if(OV_LOG) fprintf(stderr,"appwheel: -> %.*s\n",n,line);
+    if(OV_LOG) fprintf(stderr,"swas: -> %.*s\n",n,line);
     if(write(OV_IN,line,(size_t)n+1)<0){
-        if(OV_LOG) fprintf(stderr,"appwheel: backdrop pipe closed\n");
+        if(OV_LOG) fprintf(stderr,"swas: backdrop pipe closed\n");
         close(OV_IN); OV_IN=-1;
     }
 }
@@ -830,7 +851,7 @@ static void ov_spawn(Config*c){
         close(to[0]); close(to[1]); close(from[0]); close(from[1]);
         execlp(c->swov,c->swov,c->overview_debug?"--backdrop-debug":"--backdrop",
                (char*)NULL);
-        fprintf(stderr,"appwheel: cannot run '%s' (%s) — no overview\n",
+        fprintf(stderr,"swas: cannot run '%s' (%s) — no overview\n",
                 c->swov,strerror(errno));
         _exit(127);
     }
@@ -852,7 +873,7 @@ static void ov_poll(SDL_Window*win){
         char*start=buf,*nl;
         while((nl=strchr(start,'\n'))!=NULL){
             *nl='\0';
-            if(OV_LOG) fprintf(stderr,"appwheel: <- %s\n",start);
+            if(OV_LOG) fprintf(stderr,"swas: <- %s\n",start);
             if(!strcmp(start,"ready")){
                 OV_READY=1;
                 SDL_RaiseWindow(win);          /* enough on X11 */
@@ -946,7 +967,7 @@ static pid_t launch(App*a,Config*c){
     if(pipe(pfd)!=0){ pfd[0]=pfd[1]=-1; }
 
     pid_t pid=fork();
-    if(pid<0){ fprintf(stderr,"appwheel: fork failed\n");
+    if(pid<0){ fprintf(stderr,"swas: fork failed\n");
                if(pfd[0]>=0){ close(pfd[0]); close(pfd[1]); } return -1; }
     if(pid==0){
         if(pfd[0]>=0) close(pfd[0]);
@@ -1054,10 +1075,10 @@ static int on_icon(float mx,float my,float cx,float cy,float rl,float hitr){
 /* ------------------------------------------------------------------ */
 static void dump_config(void){
     fputs(
-"# appwheel config  —  ~/.config/appwheel/config\n"
+"# swas config  —  ~/.config/swas/config\n"
 "# One key=value per line. '#' starts a comment. Blank lines are ignored.\n"
 "# Every key here also works on the command line (key=value or --key=value);\n"
-"# command-line values win over the file. See `appwheel --help` for the full list.\n"
+"# command-line values win over the file. See `swas --help` for the full list.\n"
 "# The values below are the built-in defaults, so this file changes nothing\n"
 "# until you edit it.\n"
 "\n"
@@ -1091,7 +1112,7 @@ static void dump_config(void){
 "title_px=25       # selected app name (center)  ui_scale, so tweak one or all)\n"
 "search_px=20      # the text you type (search box)\n"
 "count_px=20       # the \"3 / 42\" counter\n"
-"# By default appwheel uses your desktop's configured font (via fontconfig).\n"
+"# By default swas uses your desktop's configured font (via fontconfig).\n"
 "# Set a .ttf path or a family name to override, e.g. font=JetBrains Mono\n"
 "# font=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\n"
 "font_px=50        # glyph atlas height; the sharpness ceiling for big text\n"
@@ -1101,9 +1122,15 @@ static void dump_config(void){
 "# and the wheel stays open. Needs swov on PATH, which is asked for the\n"
 "# workspace list and does the moving.\n"
 "drop=1           # 0 = off, the wheel then only launches\n"
-"drop_shrink=0.55 # how small the wheel goes while you drag\n"
-"drop_corner=top-left  # top-left, top-right or none. Letting go over the\n"
-"                 # wheel there cancels instead of opening anything\n"
+"drop_size=132    # how wide the wheel is while you drag, in pixels. It is\n"
+"                 # scaled, not redrawn, so it looks the same, just small.\n"
+"                 # 0 = use drop_shrink as a fraction of the screen instead\n"
+"drop_shrink=0.55 # that fraction, when drop_size is 0\n"
+"drop_corner=center  # where it sits then: center, top-left, top-right,\n"
+"                 # bottom-left, bottom-right. Letting go over the wheel\n"
+"                 # cancels wherever it is\n"
+"drop_bg=0d1117d9 # a disc behind the wheel while it is small, so it does\n"
+"                 # not get lost over the overview. Alpha 0 for none\n"
 "drop_ms=130      # how long that takes\n"
 "drop_px=10       # movement before a press turns into a drag\n"
 "drop_focus=0     # 1 = also switch to that workspace\n"
@@ -1112,15 +1139,15 @@ static void dump_config(void){
 "# swov=swov      # the binary to ask (a path works too)\n"
 "\n"
 "# --- launching / ordering ---\n"
-"# appwheel logs every app you launch to the history file below and shows the\n"
+"# swas logs every app you launch to the history file below and shows the\n"
 "# most-recently-opened ones first. This is the default (sort=recent).\n"
 "sort=recent       # recent = most-recently-opened first (DEFAULT) | alpha = A-Z\n"
 "launcher=sh       # sh = run Exec= ; gtk-launch = launch by desktop id\n"
 "terminal=xterm    # used for Terminal=true entries when launcher=sh\n"
-"# history=~/.cache/appwheel/history   # the opened-apps log (auto-created)\n"
+"# history=~/.cache/swas/history   # the opened-apps log (auto-created)\n"
 "\n"
 "# which apps show / in what order (an id is the .desktop filename without\n"
-"# the extension; run `appwheel --list` to see them):\n"
+"# the extension; run `swas --list` to see them):\n"
 "# dirs=~/.local/share/applications:/usr/share/applications\n"
 "# include=firefox,code,gimp     # show ONLY these ids, in this exact order\n"
 "# exclude=htop,xterm            # hide these (matches id OR Name)\n"
@@ -1141,20 +1168,20 @@ static void dump_config(void){
 
 static void usage(const char*a0){
     printf(
-"appwheel " APPWHEEL_VERSION " (build " APPWHEEL_BUILD ") — a radial app launcher\n"
+"swas " SWAS_VERSION " (build " SWAS_BUILD ") — Sway App Selector, a radial launcher\n"
 "\n"
 "USAGE\n"
 "  %s [options] [key=value ...]\n"
 "\n"
 "  Every config key below is also a command-line argument. Both forms work:\n"
-"      appwheel slots=8 arc=220 icons=0\n"
-"      appwheel --slots=8 --arc=220 --icons=0\n"
+"      swas slots=8 arc=220 icons=0\n"
+"      swas --slots=8 --arc=220 --icons=0\n"
 "  CLI values override the config file.\n"
 "\n"
 "OPTIONS\n"
 "  -c, --config PATH   config file (default: $XDG_CONFIG_HOME/wheel/config)\n"
 "      --dump-config   print a commented default config (redirect to save it):\n"
-"                        appwheel --dump-config > ~/.config/appwheel/config\n"
+"                        swas --dump-config > ~/.config/swas/config\n"
 "      --list          print discovered apps (with resolved icon) and exit\n"
 "      --no-recent     rank matches purely by relevance, ignoring recent-app bias\n"
 "  -d, --dmenu         read newline-separated items from stdin, print the chosen\n"
@@ -1189,9 +1216,12 @@ static void usage(const char*a0){
 "  and the wheel stays open. Dropping it back on the wheel does nothing.\n"
 "  Needs swov on PATH — it supplies the workspace list and moves the window.\n"
 "  drop=1              0 = off\n"
-"  drop_shrink=0.55    how small the wheel goes while dragging\n"
-"  drop_corner=top-left  where it parks while dragging: top-left, top-right\n"
-"                      or none. Letting go over the wheel there cancels\n"
+"  drop_size=132       how wide the wheel is while dragging, in pixels;\n"
+"                      0 falls back to drop_shrink as a fraction\n"
+"  drop_corner=center  where it sits then: center, top-left, top-right,\n"
+"                      bottom-left, bottom-right. Letting go over the wheel\n"
+"                      cancels wherever it is\n"
+"  drop_bg=0d1117d9    a disc behind it while it is small\n"
 "  drop_ms=130 drop_px=10\n"
 "  drop_focus=0        1 = also switch to that workspace\n"
 "  swov=swov           the binary to ask\n"
@@ -1205,7 +1235,7 @@ static void usage(const char*a0){
 "  An app's \"id\" is just its .desktop filename without the extension:\n"
 "      /usr/share/applications/firefox.desktop      -> id \"firefox\"\n"
 "      ~/.local/share/applications/spotify.desktop  -> id \"spotify\"\n"
-"  Run  appwheel --list  to print every id next to its visible Name.\n"
+"  Run  swas --list  to print every id next to its visible Name.\n"
 "\n"
 "  sort=recent                    recent (most-recently-opened first, the\n"
 "                                 DEFAULT) | alpha (A-Z). Every launch is\n"
@@ -1219,10 +1249,10 @@ static void usage(const char*a0){
 "  history=PATH                   recency file (default ~/.cache/wheel/history)\n"
 "\n"
 "EXAMPLES\n"
-"  appwheel --list                          # discover ids\n"
-"  appwheel include=firefox,code,gimp       # a curated wheel, in that order\n"
-"  appwheel exclude=htop sort=alpha ssaa=3  # hide htop, A-Z, extra-smooth\n"
-"  appwheel ui_scale=1.3 icon_px=56         # bigger text and icons\n"
+"  swas --list                          # discover ids\n"
+"  swas include=firefox,code,gimp       # a curated wheel, in that order\n"
+"  swas exclude=htop sort=alpha ssaa=3  # hide htop, A-Z, extra-smooth\n"
+"  swas ui_scale=1.3 icon_px=56         # bigger text and icons\n"
 "\n"
 "COLORS  (#rrggbb or #rrggbbaa)\n"
 "  bg ring ring2 hl text hltext center accent dim\n"
@@ -1263,9 +1293,8 @@ static void load_apps(AppList*apps, Config*cfg, int dmenu){
 int main(int argc,char**argv){
     Config cfg; config_defaults(&cfg);
     char cfgpath[PATH_MAX];
-    const char*xc=getenv("XDG_CONFIG_HOME"),*home=getenv("HOME");
-    if(xc&&*xc) snprintf(cfgpath,sizeof cfgpath,"%s/appwheel/config",xc);
-    else snprintf(cfgpath,sizeof cfgpath,"%s/.config/appwheel/config",home?home:".");
+    
+    xdg_path(cfgpath,sizeof cfgpath,"XDG_CONFIG_HOME",".config","config");
 
     int want_list=0, dmenu=0;
     for(int i=1;i<argc;i++){
@@ -1273,13 +1302,13 @@ int main(int argc,char**argv){
             snprintf(cfgpath,sizeof cfgpath,"%s",argv[++i]);
         else if(!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")){ usage(argv[0]); return 0; }
         else if(!strcmp(argv[i],"-v")||!strcmp(argv[i],"--version")){
-            printf("appwheel %s (build %s)\n",APPWHEEL_VERSION,APPWHEEL_BUILD); return 0; }
+            printf("swas %s (build %s)\n",SWAS_VERSION,SWAS_BUILD); return 0; }
         else if(!strcmp(argv[i],"--dump-config")){ dump_config(); return 0; }
         else if(!strcmp(argv[i],"--list")) want_list=1;
         else if(!strcmp(argv[i],"--dmenu")||!strcmp(argv[i],"-d")) dmenu=1;
     }
     { char tmp[PATH_MAX]; expand_tilde(cfgpath,tmp,sizeof tmp); snprintf(cfgpath,sizeof cfgpath,"%s",tmp); }
-    sw_shared_apply("appwheel",config_set_shared,&cfg);   /* shared first */
+    sw_shared_apply("swas",config_set_shared,&cfg);   /* shared first */
     config_load(&cfg,cfgpath);                            /* our own wins  */
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"-c")||!strcmp(argv[i],"--config")){ i++; continue; }
@@ -1304,9 +1333,9 @@ int main(int argc,char**argv){
         return 0;
     }
 
-    /* Identify as appwheel so the compositor shows the same name everywhere,
+    /* Identify as swas so the compositor shows the same name everywhere,
        Wayland app_id / X11 WM_CLASS so float/center rules match. Before init. */
-    SDL_SetAppMetadata(APP_ID,APPWHEEL_VERSION,"org.appwheel.appwheel");
+    SDL_SetAppMetadata(APP_ID,SWAS_VERSION,"org.swas.selector");
     SDL_SetHint(SDL_HINT_APP_ID,APP_ID);
 
     if(!SDL_Init(SDL_INIT_VIDEO)){ fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1; }
@@ -1341,7 +1370,7 @@ int main(int argc,char**argv){
 
     load_apps(&apps,&cfg,dmenu);                    /* slow part; keystrokes queue meanwhile */
 
-    if(apps.n==0){ fprintf(stderr,"appwheel: no %s\n", dmenu?"input on stdin":".desktop applications found");
+    if(apps.n==0){ fprintf(stderr,"swas: no %s\n", dmenu?"input on stdin":".desktop applications found");
                    SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit(); return 1; }
 
     Font font; memset(&font,0,sizeof font);
@@ -1354,7 +1383,7 @@ int main(int argc,char**argv){
     if(!*fontpath) try_font_paths(fontpath,sizeof fontpath);         /* last-resort known paths */
     int atlas_px=(int)(cfg.font_px*cfg.ui_scale); if(atlas_px<10)atlas_px=10; if(atlas_px>200)atlas_px=200;
     if(*fontpath) font_load(&font,ren,fontpath,atlas_px);
-    if(!font.ok) fprintf(stderr,"appwheel: no usable TTF font found; using built-in font\n");
+    if(!font.ok) fprintf(stderr,"swas: no usable TTF font found; using built-in font\n");
 
     int *filt=malloc(apps.n*sizeof*filt); int fn=0; char query[256]={0};
     int off=0, selslot=0;                 /* fixed highlight = off+selslot     */
@@ -1403,8 +1432,19 @@ int main(int argc,char**argv){
         int w,h; SDL_GetWindowSize(win,&w,&h);
         int ss=cfg.ssaa;
 
-        {   /* ease the wheel down to drop_shrink and into its corner, and back */
-            float want = dragging ? cfg.drop_shrink : 1.0f;
+        {   /* ease the wheel down to its dragging size and place, and back.
+               drop_size is a width in pixels, which is what you actually want
+               to say — "about a hundred across" — rather than a fraction of a
+               screen you have to work out. */
+            float full = (float)(w<h?w:h);
+            float want = 1.0f;
+            if(dragging){
+                want = cfg.drop_size>0 && cfg.radius>0.0f && full>0.0f
+                     ? (float)cfg.drop_size/(2.0f*cfg.radius*full)
+                     : cfg.drop_shrink;
+                if(want<0.04f) want=0.04f;
+                if(want>1.0f)  want=1.0f;
+            }
             float step = cfg.drop_ms>0 ? 16.0f/(float)cfg.drop_ms : 1.0f;
             if(wheel_scale<want){ wheel_scale+=step; if(wheel_scale>want)wheel_scale=want; }
             else if(wheel_scale>want){ wheel_scale-=step; if(wheel_scale<want)wheel_scale=want; }
@@ -1418,15 +1458,17 @@ int main(int argc,char**argv){
         float R=mind*cfg.radius, ri=R*0.46f, rc=ri*0.95f, rl=(R+ri)/2.0f;
         float cx=w/2.0f, cy=h/2.0f + cfg.y_offset*mind;
 
-        /* Out of the way: parked in a corner the wheel stops covering the
-           workspaces you are aiming at, and becomes the place to drop an app
-           you have changed your mind about. */
-        int corner_left = !strcmp(cfg.drop_corner,"top-left");
-        int corner_on   = corner_left || !strcmp(cfg.drop_corner,"top-right");
-        if(corner_on && corner_t>0.0f){
+        /* Out of the way. Small enough in the middle it stops covering what
+           you are aiming at; a corner moves it further still. Either way it
+           stays the place to drop an app you have changed your mind about. */
+        int c_left  = strstr(cfg.drop_corner,"left")   != NULL;
+        int c_right = strstr(cfg.drop_corner,"right")  != NULL;
+        int c_top   = strstr(cfg.drop_corner,"top")    != NULL;
+        int c_bot   = strstr(cfg.drop_corner,"bottom") != NULL;
+        if((c_left||c_right||c_top||c_bot) && corner_t>0.0f){
             float pad=R*0.12f+14.0f*cfg.ui_scale;
-            float tx=corner_left ? R+pad : (float)w-R-pad;
-            float ty=R+pad;
+            float tx = c_left ? R+pad : c_right ? (float)w-R-pad : cx;
+            float ty = c_top  ? R+pad : c_bot   ? (float)h-R-pad : cy;
             float e=corner_t*corner_t*(3.0f-2.0f*corner_t);   /* smoothstep */
             cx += (tx-cx)*e;
             cy += (ty-cy)*e;
@@ -1679,16 +1721,34 @@ int main(int argc,char**argv){
             else ss=1;
         }
 
-        SDL_SetRenderDrawColor(ren,cfg.bg.r,cfg.bg.g,cfg.bg.b,cfg.bg.a);
+        /* With swov behind us it draws its own scrim; a second one over the
+           top only makes the thing you are aiming at harder to see. */
+        Col clearc = OV_READY ? (Col){0,0,0,0} : cfg.bg;
+        SDL_SetRenderDrawColor(ren,clearc.r,clearc.g,clearc.b,clearc.a);
         SDL_RenderClear(ren);
 
         float slotw=step;
-        float label_px=cfg.label_px*ui;
+        /* everything inside the wheel is measured against this, so shrinking
+           the wheel shrinks its contents by the same amount and it reads as
+           the same picture, just smaller. The workspace tiles and the app on
+           the pointer keep the real ui scale. */
+        float uiw=ui*wheel_scale;
+        float label_px=cfg.label_px*uiw;
         /* app-data crossfade: on a results change, the names/icons/highlight text
            fade back in while the ring sectors (background) stay put — smooths fast
            typing without delaying anything. */
         float af = (cfg.animate && cfg.anim_ms>0)
                    ? clampf(0.30f + 0.70f*(float)(SDL_GetTicks()-anim0)/(float)cfg.anim_ms, 0.0f, 1.0f) : 1.0f;
+
+        /* Small, over a busy overview, the wheel had nothing to sit on and
+           read as a handful of loose marks. A disc behind it gives it an edge
+           again — only while it is small, fading in with the shrink. */
+        if(corner_t>0.0f && cfg.drop_bg.a){
+            Col d=cfg.drop_bg;
+            d.a=(Uint8)(d.a*clampf(corner_t,0.0f,1.0f));
+            fill_circle(ren,cx,cy,R*1.10f,d);
+        }
+
         for(int i=0;i<vis;i++){
             int item=filt[off+i];
             float a = astart+(i+0.5f)*step;
@@ -1710,8 +1770,8 @@ int main(int argc,char**argv){
 
             SDL_Texture*ic=app_icon(ren,&apps.v[item],&cfg);
             if(ic){
-                float isz=cfg.icon_px*ui; if(isz>chord)isz=chord;
-                float gap=7.0f*ui;                       /* breathing room */
+                float isz=cfg.icon_px*uiw; if(isz>chord)isz=chord;
+                float gap=7.0f*uiw;                       /* breathing room */
                 float blockH=isz+gap+label_px;
                 float topy=ly-blockH/2;
                 SDL_FRect dst={lx-isz/2, topy, isz, isz};
@@ -1733,13 +1793,13 @@ int main(int argc,char**argv){
             { int on=(page_dir<0); float sp=on?page_speed:0;
               Col c=on?cfg.accent:cfg.dim; c.a=on?255:210;
               int cnt=1+(on?(int)lroundf(sp*2):0);
-              float s=(19.0f+ (on?13.0f*sp:0))*ui;
+              float s=(19.0f+ (on?13.0f*sp:0))*uiw;
               draw_chevrons(ren,lxp,lyp,-1,s,cnt,c); }
             /* right */
             { int on=(page_dir>0); float sp=on?page_speed:0;
               Col c=on?cfg.accent:cfg.dim; c.a=on?255:210;
               int cnt=1+(on?(int)lroundf(sp*2):0);
-              float s=(19.0f+ (on?13.0f*sp:0))*ui;
+              float s=(19.0f+ (on?13.0f*sp:0))*uiw;
               draw_chevrons(ren,rxp,ryp,+1,s,cnt,c); }
         }
 
@@ -1750,20 +1810,20 @@ int main(int argc,char**argv){
         if(query[0]) snprintf(shown,sizeof shown,"%s%s",query,caret?"|":" ");
         else         snprintf(shown,sizeof shown,"type to search");
         Col qc=query[0]?cfg.accent:cfg.dim;
-        text_centered(ren,&font,cx,cy-rc*0.42f,cfg.search_px*ui,qc,shown);
+        text_centered(ren,&font,cx,cy-rc*0.42f,cfg.search_px*uiw,qc,shown);
 
         if(fn){
             int sel_item=filt[sel]; last_sel=sel_item;
             float caf = (sel_item==snap_sel)?1.0f:af;      /* same app in the hub -> no fade */
-            char nm[200]; fit_label(&font,cfg.title_px*ui,apps.v[sel_item].name,rc*1.7f,nm,sizeof nm);
+            char nm[200]; fit_label(&font,cfg.title_px*uiw,apps.v[sel_item].name,rc*1.7f,nm,sizeof nm);
             Col nmc=cfg.text; nmc.a=(Uint8)(nmc.a*caf);
-            text_centered(ren,&font,cx,cy,cfg.title_px*ui,nmc,nm);
+            text_centered(ren,&font,cx,cy,cfg.title_px*uiw,nmc,nm);
             char cnt[64]; snprintf(cnt,sizeof cnt,"%d / %d",sel+1,fn);
             Col cc=cfg.dim; cc.a=(Uint8)(cc.a*caf);
-            text_centered(ren,&font,cx,cy+rc*0.40f,cfg.count_px*ui,cc,cnt);
+            text_centered(ren,&font,cx,cy+rc*0.40f,cfg.count_px*uiw,cc,cnt);
         } else {
             last_sel=-1;
-            text_centered(ren,&font,cx,cy,cfg.title_px*ui,cfg.dim,"no matches");
+            text_centered(ren,&font,cx,cy,cfg.title_px*uiw,cfg.dim,"no matches");
         }
 
         /* --- the workspaces, and the app hanging off the pointer --- */

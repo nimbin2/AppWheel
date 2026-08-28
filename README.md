@@ -1,9 +1,9 @@
-# appwheel
+# swas
 
-A radial app launcher, drawn with SDL3. Apps sit in wide slots across the top
+Sway App Selector: a radial app launcher, drawn with SDL3. Apps sit in wide slots across the top
 arc; point at one and click, or type to filter. Works on Wayland and X11.
 
-![appwheel](screenshot.png)
+![swas](screenshot.png)
 
 100% vibecode, but tested.
 
@@ -15,7 +15,7 @@ Debian trixie and newer:
 sudo apt install build-essential pkg-config libsdl3-dev
 make
 make install          # ~/.local/bin, or PREFIX=/usr/local
-make config           # optional: write a default config to ~/.config/appwheel/config
+make config           # optional: write a default config to ~/.config/swas/config
 ```
 
 `make static` bakes SDL3 into the binary, so it runs without `libSDL3.so`. It
@@ -29,8 +29,8 @@ Needs any TTF font. Icons need a `.desktop` file and an icon theme.
 ## Use
 
 ```
-bindsym $mod+space exec appwheel
-for_window [app_id="appwheel"] floating enable, border none
+bindsym $mod+space exec swas
+for_window [app_id="swas"] floating enable, border none
 ```
 
 | key | action |
@@ -46,27 +46,33 @@ for_window [app_id="appwheel"] floating enable, border none
 
 Apps are read from the `.desktop` files in the usual directories. The wheel
 shows the most recently opened ones first; every launch is written to
-`~/.cache/appwheel/history`.
+`~/.cache/swas/history`.
 
 ```sh
-appwheel --list                       # every id, name and resolved icon
-appwheel include=firefox,code,gimp    # a curated wheel, in that order
-appwheel --dmenu < items              # a dmenu-style picker on stdin/stdout
+swas --list                       # every id, name and resolved icon
+swas include=firefox,code,gimp    # a curated wheel, in that order
+swas --dmenu < items              # a dmenu-style picker on stdin/stdout
 ```
 
 ## Drop onto a workspace
 
 Drag an app out of the wheel and let go over a workspace: it starts *there*,
-while you stay where you are. As you drag, the wheel shrinks and slides into
-the top-left corner, out of the way of what you are aiming at, and it stays
-open afterwards, ready for the next one.
+while you stay where you are. As you drag, the wheel shrinks to about
+a hundred and thirty pixels across and stays where it is, out of the way of what you are
+aiming at. It is scaled, not redrawn — the same picture, just small — and it
+stays open afterwards, ready for the next one.
 
 Letting go over the wheel itself cancels — nothing opens, and the workspace
 underneath it is never picked up by mistake. A ring around the wheel says so
 while you hover there. `esc` and right click cancel too.
 
-`drop_corner=top-right` parks it on the other side, `none` leaves it in the
-middle.
+While it is small it sits on a disc of its own (`drop_bg`), so it keeps an
+edge against a busy overview instead of reading as a handful of loose marks.
+
+`drop_size` is that width in pixels, which is what you actually want to say
+rather than a fraction of a screen you have to work out; `drop_size=0` falls
+back to `drop_shrink` as a fraction. `drop_corner` moves it out of the middle
+— `top-left`, `top-right`, `bottom-left`, `bottom-right`, or `center`.
 
 Grey outlined tiles are numbers that have no workspace yet — drop on one and
 sway makes it.
@@ -77,12 +83,17 @@ sway makes it.
 underneath, showing every workspace with the windows already in it.
 
 ```
-bindsym $mod+space exec appwheel overview=1
+bindsym $mod+space exec swas overview=1
 
 no_focus [app_id="swov-backdrop"]
 for_window [app_id="swov-backdrop"] floating enable, border none
-for_window [app_id="appwheel"] floating enable, border none
+for_window [app_id="swas"] floating enable, border none
 ```
+
+The app id changed with the name, so any rule of yours saying `app_id="appwheel"`
+needs updating. The config and history move too — `~/.config/swas/config` and
+`~/.cache/swas/history` — but the old `appwheel` ones are still read when the
+new ones are absent, so nothing is lost by not moving them.
 
 `no_focus` is a command in its own right and takes the criteria as its
 argument — it is *not* something you put after `for_window`. Written the wrong
@@ -95,7 +106,7 @@ If something looks wrong, run it from a terminal with `overview_debug=1`:
 every line between the two, and swov's own complaints, go to stderr.
 
 The backdrop maps on top of the wheel — on Wayland a window cannot lift itself
-back — so appwheel asks swov to restack it as soon as that window is up. If
+back — so swas asks swov to restack it as soon as that window is up. If
 you ever end up with a wheel that ignores the mouse, that is what went wrong;
 `esc` still closes it, and `overview=0` falls back to the plain tiles.
 
@@ -108,7 +119,7 @@ vertically. A bar shows the edge before you let go, the same one swov draws
 when you drag a window inside it. That way a workspace can be filled with a
 few apps in the arrangement you want without touching any of them afterwards.
 
-The app is placed before it opens, not moved after: appwheel hands swov the
+The app is placed before it opens, not moved after: swas hands swov the
 pid the moment it launches, and swov puts an `assign` rule in sway's way while
 the process is still starting. Nothing flashes onto the workspace you are on.
 
@@ -118,34 +129,35 @@ go and then pick one to switch to. The one catch is dropping on the workspace
 you are already on: the app opens behind the wheel, so you will not see it
 until you close it. `drop_close_here=1` closes the wheel in that case.
 
-appwheel starts it only after its own first frame is on screen, and swov fades
+swas starts it only after its own first frame is on screen, and swov fades
 in from nothing, so picking an app straight away shows no flicker at all — you
 never see it arrive. While you drag, the wheel shrinks and the workspace under
 the pointer takes the selection cursor. Let go and the app starts there.
 
-The overview is drawn soft while you are still choosing an app, and sharpens
-as soon as you start dragging — set `blur` in swov's own config.
+Nothing of the wheel's own is drawn over the overview while it is up — no
+second scrim on top of swov's — and the overview is drawn soft while you are
+still choosing an app, sharpening as soon as you start dragging — set `blur` in swov's own config.
 
-The two talk over a pipe, one line each way: appwheel sends the pointer as a
+The two talk over a pipe, one line each way: swas sends the pointer as a
 fraction of the screen, swov answers with the workspace under it. Closing the
 wheel closes the pipe, and the backdrop fades out and leaves.
 
-This needs swov on `PATH`: appwheel asks it for the
+This needs swov on `PATH`: swas asks it for the
 workspace list and hands it the launched process, which swov follows until its
 window appears and then moves. Without swov the feature is simply off. Set
 `drop_focus=1` to follow the app to its workspace instead of staying put.
 
 ## Config
 
-`${XDG_CONFIG_HOME:-~/.config}/appwheel/config`, `key=value`, `#` comments.
+`${XDG_CONFIG_HOME:-~/.config}/swas/config`, `key=value`, `#` comments.
 Every key is also a command line option:
 
 ```sh
-appwheel slots=8 arc=220 icons=0
-appwheel --ui_scale=1.3 --icon_px=56
+swas slots=8 arc=220 icons=0
+swas --ui_scale=1.3 --icon_px=56
 ```
 
-`appwheel --dump-config` prints the whole set with defaults. A `#` after
+`swas --dump-config` prints the whole set with defaults. A `#` after
 whitespace starts a comment, so the annotated lines that command prints can be
 kept as they are. The ones worth
 knowing:
@@ -168,19 +180,21 @@ knowing:
 | `overview_debug` | `1` = print the backdrop conversation to stderr |
 | `drop_close_here` | close after a drop on the current workspace; `0` = stay |
 | `drop_shrink`, `drop_ms`, `drop_px` | how the wheel gets out of the way |
-| `drop_corner` | where it parks while dragging: `top-left`, `top-right`, `none` |
+| `drop_size` | how wide the wheel is while dragging, in px; `0` = use `drop_shrink` |
+| `drop_bg` | the disc behind it while it is small; alpha `00` for none |
+| `drop_corner` | where it sits then: `center`, `top-left`, `top-right`, `bottom-left`, `bottom-right` |
 | `drop_focus` | `1` = switch to the workspace the app landed on |
 | `swov` | the binary asked about workspaces |
 
 ### Shared config
 
-Colours and fonts for appwheel, swov and swbr can be set once in
+Colours and fonts for swas, swov and swbr can be set once in
 `${XDG_CONFIG_HOME:-~/.config}/sw/config`, using role names (`surface`,
 `accent`, `hl`, ...) that each program maps onto its own keys. `sw_theme.h`
 lists them all.
 
-Keys written before any section go to all three programs; a `[appwheel]`
-section goes to appwheel only and takes its own key names as well. The config
+Keys written before any section go to all three programs; a `[swas]`
+section goes to swas only and takes its own key names as well. The config
 above is read afterwards, so it always wins, and the command line wins over
 that.
 
