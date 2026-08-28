@@ -873,6 +873,11 @@ static void ov_poll(SDL_Window*win){
                         if(id&&ed){ snprintf(OV_BESIDE,sizeof OV_BESIDE,"%s",id);
                                     snprintf(OV_EDGE,sizeof OV_EDGE,"%s",ed); }
                     }
+                    else if(!strcmp(tok,"outer")){   /* beside the whole lot */
+                        char*ed=strtok(NULL," ");
+                        if(ed){ OV_BESIDE[0]='\0';
+                                snprintf(OV_EDGE,sizeof OV_EDGE,"%s",ed); }
+                    }
                 }
             }
             start=nl+1;
@@ -902,8 +907,9 @@ static void adopt_to(Config*c,pid_t pid,const char*target,
         if(fd>=0){ dup2(fd,0); dup2(fd,1); dup2(fd,2); if(fd>2) close(fd); }
         const char*av[12]; int n=0;
         av[n++]=c->swov; av[n++]="--adopt"; av[n++]=spid; av[n++]=target;
-        if(beside&&*beside&&edge&&*edge){
-            av[n++]="--beside"; av[n++]=beside; av[n++]="--edge"; av[n++]=edge;
+        if(edge&&*edge){
+            if(beside&&*beside){ av[n++]="--beside"; av[n++]=beside; }
+            av[n++]="--edge"; av[n++]=edge;
         }
         if(c->drop_focus)      av[n++]="--adopt-focus";
         if(c->overview_debug)  av[n++]="--adopt-debug";

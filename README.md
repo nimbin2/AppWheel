@@ -99,6 +99,8 @@ back — so appwheel asks swov to restack it as soon as that window is up. If
 you ever end up with a wheel that ignores the mouse, that is what went wrong;
 `esc` still closes it, and `overview=0` falls back to the plain tiles.
 
+Drop it against the **edge of a workspace** and it opens beside everything
+already there — left of a column of two windows, not left of the top one.
 Drop it on an empty part of a workspace and it lands at the end of the layout.
 Drop it on the **left or right edge of a window already there** and it opens
 beside it, splitting horizontally; the **top or bottom edge** splits
